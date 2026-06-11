@@ -1,0 +1,11 @@
+.venv/
+.uv-cache/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+
+# Local scratch files
+tmp.txt
+
+# Generated analysis artifacts
+analysis/outputs/
