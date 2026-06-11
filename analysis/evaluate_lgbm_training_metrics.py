@@ -232,7 +232,7 @@ def write_model_evaluation_artifacts(
         "notes": [
             "IC and RankIC are computed within each trading-date cross section before aggregation.",
             "Top-bottom groups are formed from the evaluated score, never from future returns.",
-            "Industry, size, ADV, and turnover diagnostics are conditional diagnostics, not training features.",
+            "Industry, size, ADV, and turnover diagnostics are evaluated as conditional context dimensions when present.",
             "Feature gain diagnostics are derived from trained model split/gain statistics and do not use future returns.",
             "Placeholder-alpha runs remain non-production research pipeline checks unless replaced by a real alpha.",
         ],

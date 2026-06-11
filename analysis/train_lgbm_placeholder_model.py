@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import pickle
 from pathlib import Path
@@ -36,7 +37,7 @@ DEFAULT_MODEL_PARAMS: dict[str, Any] = {
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Train fold-wise LGBMRegressor models for p = g(alpha_placeholder, c)."
+        description="Train fold-wise LGBMRegressor models for p = g(signal, context)."
     )
     parser.add_argument("--training-panel", required=True, type=Path)
     parser.add_argument("--fold-assignments", required=True, type=Path)
@@ -98,6 +99,9 @@ def main() -> None:
         model_params=model_params,
         early_stopping_rounds=args.early_stopping_rounds,
         fold_ids=args.fold_ids,
+        training_metadata=training_data_summary.get("metadata"),
+        training_data_summary=training_data_summary,
+        training_data_summary_path=args.training_data_summary,
     )
     print(json.dumps(result["summary"], ensure_ascii=False, indent=2))
 
@@ -113,13 +117,27 @@ def train_placeholder_lgbm_models(
     model_factory: Callable[..., Any] | None = None,
     early_stopping_rounds: int = 200,
     fold_ids: list[int] | None = None,
+    training_metadata: dict[str, Any] | None = None,
+    training_data_summary: dict[str, Any] | None = None,
+    training_data_summary_path: Path | None = None,
 ) -> dict[str, Any]:
     prepared_panel = _prepare_panel(panel)
     prepared_folds = _prepare_fold_assignments(fold_assignments)
-    features = _feature_columns(feature_roles)
-    alpha_features = list(feature_roles.get("alpha_placeholder", []))
-    categorical_features = list(feature_roles.get("condition_categorical", []))
-    _validate_training_inputs(prepared_panel, prepared_folds, features, categorical_features, target_col)
+    feature_contract = _feature_contract(feature_roles)
+    model_feature_roles = feature_contract["feature_roles"]
+    features = feature_contract["feature_columns"]
+    signal_features = feature_contract["signal_features"]
+    categorical_features = feature_contract["condition_categorical"]
+    continuous_features = feature_contract["condition_continuous"]
+    context_features = feature_contract["context_features"]
+    _validate_training_inputs(
+        prepared_panel,
+        prepared_folds,
+        features,
+        categorical_features,
+        target_col,
+        target_columns=feature_contract["targets"],
+    )
 
     if model_factory is None:
         model_factory = _lightgbm_model_factory
@@ -134,6 +152,17 @@ def train_placeholder_lgbm_models(
     if not selected_fold_ids:
         raise ValueError("No fold ids selected for training.")
 
+    summary_metadata = _metadata_from_training_summary(training_data_summary, training_metadata)
+    run_metadata = _training_metadata(
+        summary_metadata,
+        signal_feature_role=feature_contract["signal_feature_role"],
+        context_only_policy="zero_signal_features_at_centered_neutral",
+    )
+    source_training_data_summary = (
+        _training_data_summary_provenance(training_data_summary_path)
+        if training_data_summary_path is not None
+        else None
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
     model_dir = output_dir / "models"
     model_dir.mkdir(parents=True, exist_ok=True)
@@ -167,10 +196,12 @@ def train_placeholder_lgbm_models(
 
         model = model_factory(**params)
         fit_kwargs = {
-            "sample_weight": train_frame["sample_weight"].astype(float).to_numpy(),
+            "sample_weight": _normalized_model_weights(train_frame["sample_weight"], split_name="train"),
             "eval_set": [(valid_X, y_valid)],
             "eval_names": ["valid"],
-            "eval_sample_weight": [valid_frame["sample_weight"].astype(float).to_numpy()],
+            "eval_sample_weight": [
+                _normalized_model_weights(valid_frame["sample_weight"], split_name="valid")
+            ],
             "feature_name": features,
             "categorical_feature": categorical_features,
         }
@@ -189,7 +220,7 @@ def train_placeholder_lgbm_models(
             ("test", test_frame, test_X),
         ]:
             direct_predictions = _predict_model(model, matrix)
-            context_matrix = _make_context_only_matrix(matrix, alpha_features)
+            context_matrix = _make_context_only_matrix(matrix, signal_features)
             context_predictions = _predict_model(model, context_matrix)
             marginal_score = direct_predictions - context_predictions
             prediction_frame = pd.DataFrame(
@@ -215,10 +246,11 @@ def train_placeholder_lgbm_models(
                 .astype(float)
             )
             prediction_frames.append(prediction_frame)
+            metric_target_col = "y_resid_fwd" if "y_resid_fwd" in prediction_frame.columns else "y_true"
             for prediction_col in ("pred_direct", "score_marginal", "score_marginal_z"):
                 split_metrics = compute_daily_prediction_metrics(
                     prediction_frame,
-                    target_col="y_true",
+                    target_col=metric_target_col,
                     pred_col=prediction_col,
                 )
                 metrics_records.append(
@@ -226,6 +258,7 @@ def train_placeholder_lgbm_models(
                         "fold_id": int(fold_id),
                         "split": split,
                         "prediction_col": prediction_col,
+                        "metric_target_col": metric_target_col,
                         **_metrics_for_csv(split_metrics),
                     }
                 )
@@ -252,11 +285,19 @@ def train_placeholder_lgbm_models(
             json.dumps(
                 {
                     "fold": fold_summary,
-                    "feature_roles": feature_roles,
+                    "feature_roles": model_feature_roles,
                     "feature_columns": features,
-                    "alpha_features": alpha_features,
+                    "signal_features": signal_features,
+                    "alpha_features": signal_features,
+                    "context_features": context_features,
                     "categorical_features": categorical_features,
+                    "continuous_features": continuous_features,
+                    "context_only_zeroed_features": signal_features,
                     "target_col": target_col,
+                    "fit_target_col": target_col,
+                    "evaluation_target_col": "y_resid_fwd",
+                    "training_metadata": run_metadata,
+                    "source_training_data_summary": source_training_data_summary,
                     "model_params": params,
                     "score_columns": [
                         "pred_direct",
@@ -306,25 +347,26 @@ def train_placeholder_lgbm_models(
         charts_dir=charts_dir,
         report_path=report_path,
         feature_gain=feature_gain_output,
-        feature_roles=feature_roles,
+        feature_roles=model_feature_roles,
         feature_columns=features,
     )
 
     summary = {
-        "metadata": {
-            "signal_stage": "placeholder_alpha_probe",
-            "alpha_source": "placeholder_liquidity",
-            "alpha_is_real": False,
-            "production_eligible": False,
-            "model_form": "p = g(alpha_placeholder, c)",
-            "training_role": "direct_and_marginal_placeholder_probe",
-        },
+        "metadata": run_metadata,
         "fold_count": int(len(selected_fold_ids)),
         "target_col": target_col,
-        "feature_roles": feature_roles,
+        "fit_target_col": target_col,
+        "evaluation_target_col": "y_resid_fwd",
+        "feature_roles": model_feature_roles,
         "feature_columns": features,
-        "alpha_features": alpha_features,
+        "signal_features": signal_features,
+        "alpha_features": signal_features,
+        "context_features": context_features,
+        "condition_categorical_features": categorical_features,
+        "condition_continuous_features": continuous_features,
         "categorical_features": categorical_features,
+        "context_only_zeroed_features": signal_features,
+        "source_training_data_summary": source_training_data_summary,
         "score_columns": ["pred_direct", "pred_context_only", "score_marginal", "score_marginal_z"],
         "model_params": params,
         "early_stopping_rounds": int(early_stopping_rounds),
@@ -345,15 +387,7 @@ def train_placeholder_lgbm_models(
             "charts": _path_for_summary(charts_dir),
             "report": _path_for_summary(report_path),
         },
-        "notes": [
-            "Each fold is trained only on dates marked train in fold_assignments.",
-            "Validation dates are used only as eval_set for early stopping.",
-            "Test dates are used only for prediction and metrics.",
-            "score_marginal = pred_direct - pred_context_only removes pure structure-only prediction.",
-            "Detailed evaluation and charts use y_resid_fwd as the realized-return target.",
-            "The current centered alpha rank convention uses neutral alpha values of 0.0.",
-            "This is a placeholder-liquidity probe, not a production alpha model.",
-        ],
+        "notes": _training_notes(run_metadata),
     }
     (output_dir / "training_summary.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2) + "\n",
@@ -365,6 +399,79 @@ def train_placeholder_lgbm_models(
         "feature_gain": feature_gain_output,
         "summary": summary,
     }
+
+
+def _metadata_from_training_summary(
+    training_data_summary: dict[str, Any] | None,
+    training_metadata: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if training_data_summary is None:
+        return training_metadata
+    metadata = training_data_summary.get("metadata")
+    if isinstance(metadata, dict):
+        return metadata
+    return training_metadata
+
+
+def _training_metadata(
+    training_metadata: dict[str, Any] | None,
+    *,
+    signal_feature_role: str,
+    context_only_policy: str,
+) -> dict[str, Any]:
+    if training_metadata is None:
+        metadata = {
+            "signal_stage": "placeholder_alpha_probe",
+            "alpha_source": "placeholder_liquidity",
+            "alpha_is_real": False,
+            "production_eligible": False,
+            "model_form": "p = g(alpha_placeholder, c)",
+            "training_role": "direct_and_marginal_placeholder_probe",
+        }
+    else:
+        metadata = {str(key): _json_safe(value) for key, value in training_metadata.items()}
+    if "training_role" not in metadata:
+        metadata["training_role"] = (
+            "direct_and_marginal_signal_probe"
+            if metadata.get("alpha_is_real") is True
+            else "direct_and_marginal_placeholder_probe"
+        )
+    metadata["signal_feature_role"] = signal_feature_role
+    metadata["context_only_policy"] = context_only_policy
+    return metadata
+
+
+def _training_notes(metadata: dict[str, Any]) -> list[str]:
+    notes = [
+        "Each fold is trained only on dates marked train in fold_assignments.",
+        "Validation dates are used only as eval_set for early stopping.",
+        "Test dates are used only for prediction and metrics.",
+        "score_marginal = pred_direct - pred_context_only subtracts a zero-signal baseline prediction.",
+        "Compact metrics, detailed evaluation, and charts use y_resid_fwd as the realized-return target.",
+        "The current centered alpha rank convention uses neutral alpha values of 0.0.",
+    ]
+    if metadata.get("alpha_is_real") is True:
+        notes.append(
+            "Context-only prediction sets signal features to the centered neutral value 0.0 and preserves context features."
+        )
+    else:
+        notes.append("This is a placeholder-liquidity probe, not a production alpha model.")
+    return notes
+
+
+def _training_data_summary_provenance(path: Path) -> dict[str, Any]:
+    return {
+        "path": _path_for_summary(path),
+        "sha256": _sha256_file(path),
+    }
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def compute_daily_prediction_metrics(
@@ -434,16 +541,109 @@ def _prepare_fold_assignments(fold_assignments: pd.DataFrame) -> pd.DataFrame:
     unknown_splits = sorted(set(frame["split"]).difference({"train", "valid", "test"}))
     if unknown_splits:
         raise ValueError(f"Unknown split labels: {unknown_splits}")
-    return frame.sort_values(["fold_id", "date"]).reset_index(drop=True)
+    frame = frame.sort_values(["fold_id", "date"]).reset_index(drop=True)
+    _validate_fold_time_order(frame)
+    return frame
+
+
+def _validate_fold_time_order(frame: pd.DataFrame) -> None:
+    required_splits = ("train", "valid", "test")
+    for fold_id, group in frame.groupby("fold_id", sort=True):
+        split_dates = {
+            split: group.loc[group["split"].eq(split), "date"].sort_values()
+            for split in required_splits
+        }
+        missing_splits = [split for split, dates in split_dates.items() if dates.empty]
+        if missing_splits:
+            raise ValueError(f"Fold {int(fold_id)} is missing split assignment(s): {missing_splits}")
+        if split_dates["train"].max() >= split_dates["valid"].min():
+            raise ValueError(
+                f"Fold {int(fold_id)} has train dates that are not strictly before validation dates."
+            )
+        if split_dates["valid"].max() >= split_dates["test"].min():
+            raise ValueError(
+                f"Fold {int(fold_id)} has validation dates that are not strictly before test dates."
+            )
 
 
 def _feature_columns(feature_roles: dict[str, list[str]]) -> list[str]:
+    return _feature_contract(feature_roles)["feature_columns"]
+
+
+def _feature_contract(feature_roles: dict[str, list[str]]) -> dict[str, Any]:
+    legacy_signal_features = _feature_role_list(feature_roles, "alpha_placeholder")
+    signal_alias_features = _feature_role_list(feature_roles, "signal_features")
+    if legacy_signal_features and signal_alias_features and legacy_signal_features != signal_alias_features:
+        raise ValueError(
+            "feature_roles['signal_features'] and feature_roles['alpha_placeholder'] "
+            "must match when both are provided."
+        )
+
+    signal_features = signal_alias_features or legacy_signal_features
+    signal_feature_role = "signal_features" if signal_alias_features else "alpha_placeholder"
+    if not signal_features:
+        raise ValueError("feature_roles must declare signal columns in 'signal_features' or 'alpha_placeholder'.")
+
+    categorical_features = _feature_role_list(feature_roles, "condition_categorical")
+    continuous_features = _feature_role_list(feature_roles, "condition_continuous")
+    context_features = categorical_features + continuous_features
+    targets = _feature_role_list(feature_roles, "targets")
+
+    _validate_role_uniqueness(
+        {
+            signal_feature_role: signal_features,
+            "condition_categorical": categorical_features,
+            "condition_continuous": continuous_features,
+        }
+    )
+
     columns: list[str] = []
-    for role in ("alpha_placeholder", "condition_categorical", "condition_continuous"):
-        for column in feature_roles.get(role, []):
+    for role_columns in (signal_features, categorical_features, continuous_features):
+        for column in role_columns:
             if column not in columns:
                 columns.append(column)
-    return columns
+    return {
+        "feature_roles": _model_feature_roles(feature_roles, signal_feature_role),
+        "feature_columns": columns,
+        "signal_features": signal_features,
+        "signal_feature_role": signal_feature_role,
+        "condition_categorical": categorical_features,
+        "condition_continuous": continuous_features,
+        "context_features": context_features,
+        "targets": targets,
+    }
+
+
+def _feature_role_list(feature_roles: dict[str, list[str]], role: str) -> list[str]:
+    return [str(column) for column in feature_roles.get(role, [])]
+
+
+def _model_feature_roles(feature_roles: dict[str, list[str]], signal_feature_role: str) -> dict[str, list[str]]:
+    roles = {str(role): _feature_role_list(feature_roles, str(role)) for role in feature_roles}
+    if signal_feature_role == "signal_features":
+        roles.pop("alpha_placeholder", None)
+    else:
+        roles.pop("signal_features", None)
+    return roles
+
+
+def _validate_role_uniqueness(role_columns: dict[str, list[str]]) -> None:
+    owner_by_column: dict[str, str] = {}
+    duplicates: dict[str, list[str]] = {}
+    for role, columns in role_columns.items():
+        seen_in_role: set[str] = set()
+        for column in columns:
+            if column in seen_in_role:
+                duplicates.setdefault(column, []).append(role)
+            seen_in_role.add(column)
+            existing_role = owner_by_column.get(column)
+            if existing_role is not None and existing_role != role:
+                duplicates.setdefault(column, [existing_role]).append(role)
+            else:
+                owner_by_column[column] = role
+    if duplicates:
+        details = {column: sorted(set(roles)) for column, roles in duplicates.items()}
+        raise ValueError(f"Feature columns must be assigned to exactly one model role: {details}")
 
 
 def _validate_training_inputs(
@@ -452,7 +652,11 @@ def _validate_training_inputs(
     features: list[str],
     categorical_features: list[str],
     target_col: str,
+    *,
+    target_columns: list[str],
 ) -> None:
+    if target_columns and target_col not in target_columns:
+        raise ValueError(f"Target column {target_col!r} is not declared in feature_roles['targets'].")
     if target_col not in panel.columns:
         raise ValueError(f"Target column {target_col!r} is missing from panel.")
     missing_features = sorted(set(features).difference(panel.columns))
@@ -508,12 +712,26 @@ def _make_feature_matrix(
     return matrix
 
 
-def _make_context_only_matrix(matrix: pd.DataFrame, alpha_features: list[str]) -> pd.DataFrame:
+def _normalized_model_weights(weights: pd.Series, *, split_name: str) -> np.ndarray:
+    normalized = pd.to_numeric(weights, errors="coerce").to_numpy(dtype=float)
+    if normalized.size == 0:
+        raise ValueError(f"{split_name} sample_weight is empty.")
+    if not np.isfinite(normalized).all():
+        raise ValueError(f"{split_name} sample_weight contains non-finite values.")
+    if np.any(normalized < 0.0):
+        raise ValueError(f"{split_name} sample_weight contains negative values.")
+    mean_weight = float(np.mean(normalized))
+    if mean_weight <= 0.0:
+        raise ValueError(f"{split_name} sample_weight must have positive mean.")
+    return normalized / mean_weight
+
+
+def _make_context_only_matrix(matrix: pd.DataFrame, signal_features: list[str]) -> pd.DataFrame:
     context = matrix.copy()
-    missing = sorted(set(alpha_features).difference(context.columns))
+    missing = sorted(set(signal_features).difference(context.columns))
     if missing:
-        raise ValueError(f"Alpha placeholder columns are missing from feature matrix: {missing}")
-    for column in alpha_features:
+        raise ValueError(f"Signal columns are missing from feature matrix: {missing}")
+    for column in signal_features:
         context[column] = 0.0
     return context
 

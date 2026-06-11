@@ -132,6 +132,157 @@ def _feature_roles() -> dict[str, list[str]]:
     }
 
 
+REAL_SIGNAL_FEATURES = [
+    "factor_sss_dx_10_rank",
+    "factor_sss_dx_10_z",
+    "amo_rank",
+    "amo_z",
+    "close_rank",
+    "close_z",
+    "vol_rank",
+    "vol_z",
+]
+
+REAL_CATEGORICAL_FEATURES = ["industry", "board", "index_bucket", "size_decile"]
+REAL_CONTINUOUS_FEATURES = [
+    "is_csi300",
+    "is_csi500",
+    "is_csi1000",
+    "is_csi2000",
+    "log_mcap_z",
+    "mcap_rank",
+]
+
+
+def _make_real_alpha_feature_panel() -> pd.DataFrame:
+    dates = pd.to_datetime(
+        [
+            "2024-01-02",
+            "2024-01-03",
+            "2024-01-04",
+            "2024-01-05",
+            "2024-01-08",
+            "2024-01-09",
+        ]
+    )
+    rows: list[dict[str, object]] = []
+    for date_idx, date in enumerate(dates):
+        for stock_idx, stock_code in enumerate(["000001", "000002", "000003"]):
+            centered = float(stock_idx - 1)
+            sample_weight = 10.0 * float(date_idx + 1) * float(stock_idx + 1)
+            row: dict[str, object] = {
+                "date": date,
+                "stock_code": stock_code,
+                "industry": ["bank", "tech", "energy"][stock_idx],
+                "board": ["SZSE_MAIN", "CHINEXT", "STAR"][stock_idx],
+                "index_bucket": ["CSI300", "CSI500", "NON_INDEX"][stock_idx],
+                "size_decile": stock_idx,
+                "is_csi300": 1 if stock_idx == 0 else 0,
+                "is_csi500": 1 if stock_idx == 1 else 0,
+                "is_csi1000": 1 if stock_idx == 2 else 0,
+                "is_csi2000": 0,
+                "log_mcap_z": centered,
+                "mcap_rank": [-1 / 3, 0.0, 1 / 3][stock_idx],
+                "factor_sss_dx_10_raw": float(100 + date_idx * 10 + stock_idx),
+                "amo_raw": float(1000 + date_idx * 10 + stock_idx),
+                "close_raw": float(10 + stock_idx),
+                "vol_raw": float(10000 + date_idx * 10 + stock_idx),
+                "factor_sss_dx_10_raw__rank_input": float(stock_idx),
+                "factor_sss_dx_10_raw__z_input": float(stock_idx),
+                "amo_raw__rank_input": float(stock_idx),
+                "amo_raw__z_input": float(stock_idx),
+                "close_raw__rank_input": float(stock_idx),
+                "close_raw__z_input": float(stock_idx),
+                "vol_raw__rank_input": float(stock_idx),
+                "vol_raw__z_input": float(stock_idx),
+                "market_cap": float(100 + 10 * stock_idx),
+                "log_mcap": float(4.5 + stock_idx),
+                "y_rank_label": float(date_idx * 10 + stock_idx),
+                "y_resid_fwd": float(date_idx - stock_idx) / 100.0,
+                "sample_weight": sample_weight,
+                "alpha_source": "factor_sss_dx_10",
+            }
+            for feature_idx, feature in enumerate(REAL_SIGNAL_FEATURES):
+                row[feature] = float((feature_idx + 1) * centered)
+            rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def _make_real_alpha_feature_roles(*, use_signal_alias: bool = False) -> dict[str, list[str]]:
+    signal_role = "signal_features" if use_signal_alias else "alpha_placeholder"
+    return {
+        signal_role: REAL_SIGNAL_FEATURES,
+        "condition_categorical": REAL_CATEGORICAL_FEATURES,
+        "condition_continuous": REAL_CONTINUOUS_FEATURES,
+        "traceability": [
+            "date",
+            "stock_code",
+            "alpha_source",
+            "market_cap",
+            "log_mcap",
+            "factor_sss_dx_10_raw",
+            "amo_raw",
+            "close_raw",
+            "vol_raw",
+        ],
+        "excluded_from_model": [
+            "date",
+            "stock_code",
+            "y_resid_fwd",
+            "y_rank_label",
+            "sample_weight",
+            "alpha_source",
+            "market_cap",
+            "log_mcap",
+            "factor_sss_dx_10_raw",
+            "amo_raw",
+            "close_raw",
+            "vol_raw",
+            "factor_sss_dx_10_raw__rank_input",
+            "factor_sss_dx_10_raw__z_input",
+            "amo_raw__rank_input",
+            "amo_raw__z_input",
+            "close_raw__rank_input",
+            "close_raw__z_input",
+            "vol_raw__rank_input",
+            "vol_raw__z_input",
+        ],
+        "targets": ["y_resid_fwd", "y_rank_label"],
+    }
+
+
+def _make_real_alpha_training_metadata() -> dict[str, object]:
+    return {
+        "signal_stage": "real_alpha_kline_feature_panel",
+        "alpha_source": "factor_sss_dx_10",
+        "alpha_is_real": True,
+        "production_eligible": False,
+        "model_form": "p = g(alpha_rank_z_and_kline_rank_z, context)",
+        "condition_set": "industry_board_index_size_v1",
+        "feature_asof": "same_date_eod_for_close_amount_volume_inputs",
+        "label_contract": "forward-looking labels aligned to signal dates",
+    }
+
+
+def _make_real_alpha_fold_assignments() -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "fold_id": [1, 1, 1, 1, 1, 1],
+            "date": pd.to_datetime(
+                [
+                    "2024-01-02",
+                    "2024-01-03",
+                    "2024-01-04",
+                    "2024-01-05",
+                    "2024-01-08",
+                    "2024-01-09",
+                ]
+            ),
+            "split": ["train", "train", "valid", "valid", "test", "test"],
+        }
+    )
+
+
 def test_train_placeholder_lgbm_models_uses_only_train_for_fit_and_test_for_prediction(
     tmp_path: Path,
 ) -> None:
@@ -166,8 +317,10 @@ def test_train_placeholder_lgbm_models_uses_only_train_for_fit_and_test_for_pred
     assert "stock_code" not in model.fit_X.columns
     assert "y_rank_label" not in model.fit_X.columns
     assert "sample_weight" not in model.fit_X.columns
-    assert np.isclose(model.fit_kwargs["sample_weight"].sum(), 2.0)
-    assert np.isclose(model.fit_kwargs["eval_sample_weight"][0].sum(), 2.0)
+    assert np.isclose(model.fit_kwargs["sample_weight"].mean(), 1.0)
+    assert np.isclose(model.fit_kwargs["eval_sample_weight"][0].mean(), 1.0)
+    assert np.isclose(model.fit_kwargs["sample_weight"].sum(), 6.0)
+    assert np.isclose(model.fit_kwargs["eval_sample_weight"][0].sum(), 6.0)
     assert set(model.fit_kwargs["categorical_feature"]) == {
         "industry",
         "board",
@@ -182,6 +335,22 @@ def test_train_placeholder_lgbm_models_uses_only_train_for_fit_and_test_for_pred
     assert {"pred_direct", "pred_context_only", "score_marginal", "score_marginal_z"}.issubset(
         predictions.columns
     )
+    assert np.allclose(
+        predictions["score_marginal"],
+        predictions["pred_direct"] - predictions["pred_context_only"],
+    )
+    metrics = result["metrics"]
+    assert set(metrics["metric_target_col"]) == {"y_resid_fwd"}
+    train_predictions = predictions[predictions["split"].eq("train")]
+    expected_resid_metrics = compute_daily_prediction_metrics(
+        train_predictions,
+        target_col="y_resid_fwd",
+        pred_col="pred_direct",
+    )
+    train_metric = metrics[
+        metrics["split"].eq("train") & metrics["prediction_col"].eq("pred_direct")
+    ].iloc[0]
+    assert np.isclose(train_metric["mean_ic"], expected_resid_metrics["mean_ic"])
     assert len(model.predict_calls) == 6
     alpha_columns = _feature_roles()["alpha_placeholder"]
     for context_call in model.predict_calls[1::2]:
@@ -215,6 +384,186 @@ def test_train_placeholder_lgbm_models_uses_only_train_for_fit_and_test_for_pred
     assert "feature_importance" not in result
     metadata = json.loads((tmp_path / "models" / "fold_1_metadata.json").read_text(encoding="utf-8"))
     assert "score_marginal_z" in metadata["score_columns"]
+
+
+def test_train_real_alpha_feature_panel_uses_signal_kline_and_context_contract(
+    tmp_path: Path,
+) -> None:
+    RecordingRegressor.instances.clear()
+
+    result = train_placeholder_lgbm_models(
+        panel=_make_real_alpha_feature_panel(),
+        fold_assignments=_make_real_alpha_fold_assignments(),
+        feature_roles=_make_real_alpha_feature_roles(use_signal_alias=True),
+        output_dir=tmp_path,
+        model_factory=RecordingRegressor,
+        model_params={"n_estimators": 10, "verbosity": -1},
+        training_metadata=_make_real_alpha_training_metadata(),
+    )
+
+    model = RecordingRegressor.instances[0]
+    expected_features = REAL_SIGNAL_FEATURES + REAL_CATEGORICAL_FEATURES + REAL_CONTINUOUS_FEATURES
+    assert model.feature_names_ == expected_features
+    forbidden_features = {
+        "date",
+        "stock_code",
+        "y_rank_label",
+        "y_resid_fwd",
+        "sample_weight",
+        "alpha_source",
+        "market_cap",
+        "log_mcap",
+        "factor_sss_dx_10_raw",
+        "amo_raw",
+        "close_raw",
+        "vol_raw",
+        "factor_sss_dx_10_raw__rank_input",
+        "factor_sss_dx_10_raw__z_input",
+        "amo_raw__rank_input",
+        "amo_raw__z_input",
+        "close_raw__rank_input",
+        "close_raw__z_input",
+        "vol_raw__rank_input",
+        "vol_raw__z_input",
+    }
+    assert forbidden_features.isdisjoint(model.fit_X.columns)
+    assert set(model.fit_kwargs["categorical_feature"]) == set(REAL_CATEGORICAL_FEATURES)
+
+    for direct_call, context_call in zip(model.predict_calls[0::2], model.predict_calls[1::2], strict=True):
+        assert np.isclose(context_call[REAL_SIGNAL_FEATURES].to_numpy(dtype=float), 0.0).all()
+        assert np.isclose(
+            context_call[REAL_CONTINUOUS_FEATURES].to_numpy(dtype=float),
+            direct_call[REAL_CONTINUOUS_FEATURES].to_numpy(dtype=float),
+        ).all()
+        for column in REAL_CATEGORICAL_FEATURES:
+            assert context_call[column].equals(direct_call[column])
+
+    assert result["summary"]["signal_features"] == REAL_SIGNAL_FEATURES
+    assert result["summary"]["context_only_zeroed_features"] == REAL_SIGNAL_FEATURES
+    assert result["summary"]["metadata"]["signal_feature_role"] == "signal_features"
+    assert result["summary"]["metadata"]["context_only_policy"] == "zero_signal_features_at_centered_neutral"
+
+
+def test_train_real_alpha_uses_fold_local_weight_normalization(
+    tmp_path: Path,
+) -> None:
+    RecordingRegressor.instances.clear()
+    panel = _make_real_alpha_feature_panel()
+
+    train_rows = panel[panel["date"].isin(pd.to_datetime(["2024-01-02", "2024-01-03"]))]
+    valid_rows = panel[panel["date"].isin(pd.to_datetime(["2024-01-04", "2024-01-05"]))]
+    expected_train_weights = (
+        train_rows["sample_weight"].astype(float) / train_rows["sample_weight"].astype(float).mean()
+    ).to_numpy(dtype=float)
+    expected_valid_weights = (
+        valid_rows["sample_weight"].astype(float) / valid_rows["sample_weight"].astype(float).mean()
+    ).to_numpy(dtype=float)
+
+    train_placeholder_lgbm_models(
+        panel=panel,
+        fold_assignments=_make_real_alpha_fold_assignments(),
+        feature_roles=_make_real_alpha_feature_roles(),
+        output_dir=tmp_path,
+        model_factory=RecordingRegressor,
+        model_params={"n_estimators": 10, "verbosity": -1},
+        training_metadata=_make_real_alpha_training_metadata(),
+    )
+
+    model = RecordingRegressor.instances[0]
+    assert np.allclose(model.fit_kwargs["sample_weight"], expected_train_weights)
+    assert np.allclose(model.fit_kwargs["eval_sample_weight"][0], expected_valid_weights)
+
+
+def test_train_real_alpha_rejects_target_not_declared_in_feature_roles(tmp_path: Path) -> None:
+    try:
+        train_placeholder_lgbm_models(
+            panel=_make_real_alpha_feature_panel(),
+            fold_assignments=_make_real_alpha_fold_assignments(),
+            feature_roles=_make_real_alpha_feature_roles(),
+            output_dir=tmp_path,
+            model_factory=RecordingRegressor,
+            model_params={"n_estimators": 10, "verbosity": -1},
+            training_metadata=_make_real_alpha_training_metadata(),
+            target_col="not_a_declared_target",
+        )
+    except ValueError as exc:
+        assert "not declared in feature_roles['targets']" in str(exc)
+    else:
+        raise AssertionError("Expected undeclared target column to raise ValueError")
+
+
+def test_train_rejects_leakage_columns_in_real_alpha_feature_roles(tmp_path: Path) -> None:
+    feature_roles = _make_real_alpha_feature_roles()
+    feature_roles["alpha_placeholder"] = [*feature_roles["alpha_placeholder"], "y_resid_fwd"]
+
+    try:
+        train_placeholder_lgbm_models(
+            panel=_make_real_alpha_feature_panel(),
+            fold_assignments=_make_real_alpha_fold_assignments(),
+            feature_roles=feature_roles,
+            output_dir=tmp_path,
+            model_factory=RecordingRegressor,
+            model_params={"n_estimators": 10, "verbosity": -1},
+            training_metadata=_make_real_alpha_training_metadata(),
+        )
+    except ValueError as exc:
+        assert "Leakage-prone columns cannot be model features" in str(exc)
+    else:
+        raise AssertionError("Expected leakage-prone feature role to raise ValueError")
+
+
+def test_train_rejects_fold_assignments_with_future_leakage_order(tmp_path: Path) -> None:
+    fold_assignments = _make_real_alpha_fold_assignments()
+    fold_assignments.loc[fold_assignments["split"].eq("train"), "date"] = pd.to_datetime(
+        ["2024-01-04", "2024-01-05"]
+    )
+    fold_assignments.loc[fold_assignments["split"].eq("valid"), "date"] = pd.to_datetime(
+        ["2024-01-02", "2024-01-03"]
+    )
+
+    try:
+        train_placeholder_lgbm_models(
+            panel=_make_real_alpha_feature_panel(),
+            fold_assignments=fold_assignments,
+            feature_roles=_make_real_alpha_feature_roles(),
+            output_dir=tmp_path,
+            model_factory=RecordingRegressor,
+            model_params={"n_estimators": 10, "verbosity": -1},
+            training_metadata=_make_real_alpha_training_metadata(),
+        )
+    except ValueError as exc:
+        assert "train dates that are not strictly before validation dates" in str(exc)
+    else:
+        raise AssertionError("Expected future-leaking fold order to raise ValueError")
+
+
+def test_train_placeholder_lgbm_models_preserves_real_alpha_training_metadata(
+    tmp_path: Path,
+) -> None:
+    RecordingRegressor.instances.clear()
+
+    result = train_placeholder_lgbm_models(
+        panel=_make_training_panel(),
+        fold_assignments=_make_fold_assignments(),
+        feature_roles=_feature_roles(),
+        output_dir=tmp_path,
+        model_factory=RecordingRegressor,
+        model_params={"n_estimators": 10, "verbosity": -1},
+        training_metadata={
+            "signal_stage": "real_alpha_kline_feature_panel",
+            "alpha_source": "factor_sss_dx_10",
+            "alpha_is_real": True,
+            "production_eligible": False,
+            "model_form": "p = g(alpha_rank_z_and_kline_rank_z, context)",
+        },
+    )
+
+    assert result["summary"]["metadata"]["signal_stage"] == "real_alpha_kline_feature_panel"
+    assert result["summary"]["metadata"]["alpha_source"] == "factor_sss_dx_10"
+    assert result["summary"]["metadata"]["alpha_is_real"] is True
+    assert result["summary"]["metadata"]["model_form"] == "p = g(alpha_rank_z_and_kline_rank_z, context)"
+    assert result["summary"]["metadata"]["training_role"] == "direct_and_marginal_signal_probe"
+    assert all("placeholder-liquidity" not in note for note in result["summary"]["notes"])
 
 
 def test_compute_daily_prediction_metrics_returns_ic_and_rankic() -> None:
