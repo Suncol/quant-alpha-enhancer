@@ -96,6 +96,18 @@ uv add --dev pytest
 uv run pytest
 ```
 
+## Windows 下 NumPy/Pandas DLL 访问被拒绝
+
+在 Windows PowerShell 或受限执行环境中，即使已经使用仓库根目录下的 `.venv`，也可能在导入 NumPy、Pandas、LightGBM 等带本地扩展的包时遇到类似错误：
+
+```text
+ImportError: DLL load failed while importing _multiarray_umath: 拒绝访问。
+```
+
+这类错误通常发生在 Python 已经启动、但本地 DLL 被当前进程权限或沙箱策略阻止加载时。它不同于 `Activate.ps1` 被 PowerShell 执行策略阻止；`Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process` 只用于临时放开激活脚本权限，通常不能解决 DLL 加载的“拒绝访问”。
+
+遇到该问题时，先保持同一个 `.venv` 和同一条 Python 命令不变，在当前工具或运行环境中申请最小必要的权限提升后重试。不要第一时间重装 NumPy、Pandas 或重建 `.venv`，除非在非受限权限下仍然稳定复现导入失败。运行评估或训练脚本时，输出仍应限定在仓库根目录下的配置输出目录，例如 `analysis/outputs/...`。
+
 ## 开发约定
 
 - Python 代码应使用类型标注。
