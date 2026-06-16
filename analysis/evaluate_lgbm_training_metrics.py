@@ -188,6 +188,7 @@ def write_model_evaluation_artifacts(
             result,
             charts_dir,
             primary_score_col="score_marginal_z" if "score_marginal_z" in score_cols else score_cols[-1],
+            target_col=target_col,
             feature_gain_result=feature_gain_result,
         )
         chart_outputs = {key: _path_for_summary(path) for key, path in chart_paths.items()}
@@ -257,6 +258,7 @@ def write_evaluation_charts(
     output_dir: Path,
     *,
     primary_score_col: str,
+    target_col: str,
     max_example_symbols: int = 6,
     feature_gain_result: dict[str, Any] | None = None,
 ) -> dict[str, Path]:
@@ -293,6 +295,7 @@ def write_evaluation_charts(
         result["evaluation_frame"],
         chart_paths["example_score_return_paths"],
         primary_score_col=primary_score_col,
+        target_col=target_col,
         max_symbols=max_example_symbols,
     )
     if feature_gain_result is not None:
@@ -728,17 +731,18 @@ def _plot_example_score_return_paths(
     path: Path,
     *,
     primary_score_col: str,
+    target_col: str,
     max_symbols: int,
 ) -> None:
     import matplotlib.pyplot as plt
 
-    required = {"date", "stock_code", "split", primary_score_col, "y_resid_fwd"}
+    required = {"date", "stock_code", "split", primary_score_col, target_col}
     if frame.empty or not required.issubset(frame.columns):
         fig, ax = plt.subplots(figsize=(11.5, 5.8), constrained_layout=True)
         _chart_title(
             fig,
-            "Example symbol score and residual-return paths",
-            "Series are z-scored per symbol to compare shape rather than scale.",
+            "Example symbol score and target paths",
+            f"Series are z-scored per symbol; target column: {target_col}.",
         )
         _plot_empty(ax, "No example path data available")
         _save_chart(fig, path)
@@ -748,13 +752,13 @@ def _plot_example_score_return_paths(
     if "test" in set(sample["split"].astype(str)):
         sample = sample[sample["split"].eq("test")].copy()
     sample = sample[np.isfinite(pd.to_numeric(sample[primary_score_col], errors="coerce"))].copy()
-    sample = sample[np.isfinite(pd.to_numeric(sample["y_resid_fwd"], errors="coerce"))].copy()
+    sample = sample[np.isfinite(pd.to_numeric(sample[target_col], errors="coerce"))].copy()
     if sample.empty:
         fig, ax = plt.subplots(figsize=(11.5, 5.8), constrained_layout=True)
         _chart_title(
             fig,
-            "Example symbol score and residual-return paths",
-            "Series are z-scored per symbol to compare shape rather than scale.",
+            "Example symbol score and target paths",
+            f"Series are z-scored per symbol; target column: {target_col}.",
         )
         _plot_empty(ax, "No finite example path data available")
         _save_chart(fig, path)
@@ -796,8 +800,8 @@ def _plot_example_score_return_paths(
     fig.subplots_adjust(top=0.88, hspace=0.50, wspace=0.12, left=0.06, right=0.985, bottom=0.07)
     _chart_title(
         fig,
-        "Example symbol score and residual-return paths",
-        "Each panel z-scores one symbol's primary score and realized residual return.",
+        "Example symbol score and target paths",
+        f"Each panel z-scores one symbol's primary score and realized target ({target_col}).",
     )
     flat_axes = list(axes.ravel())
     for ax in flat_axes[len(symbols):]:
@@ -808,7 +812,7 @@ def _plot_example_score_return_paths(
         if group.empty:
             continue
         score_z = _zscore_array(pd.to_numeric(group[primary_score_col], errors="coerce").to_numpy(dtype=float))
-        return_z = _zscore_array(pd.to_numeric(group["y_resid_fwd"], errors="coerce").to_numpy(dtype=float))
+        return_z = _zscore_array(pd.to_numeric(group[target_col], errors="coerce").to_numpy(dtype=float))
         ax.plot(
             group["date"],
             score_z,
@@ -1173,8 +1177,9 @@ def _report_key_metrics(overall_metrics: pd.DataFrame, primary_score_col: str) -
 
 def _report_chart_block(report_path: Path, chart_key: str, chart_path_text: str) -> str:
     chart_path = Path(chart_path_text)
+    report_dir = report_path.parent
     if not chart_path.is_absolute():
-        report_relative = report_path.parent / chart_path
+        report_relative = report_dir / chart_path
         cwd_relative = Path.cwd() / chart_path
         if report_relative.exists():
             chart_path = report_relative
@@ -1183,8 +1188,8 @@ def _report_chart_block(report_path: Path, chart_key: str, chart_path_text: str)
         else:
             chart_path = report_relative
     try:
-        src = chart_path.relative_to(report_path.parent).as_posix()
-    except ValueError:
+        src = chart_path.resolve().relative_to(report_dir.resolve()).as_posix()
+    except (OSError, ValueError):
         src = chart_path.name
     title = chart_key.replace("_", " ").title()
     return f"<h3>{html.escape(title)}</h3>\n<img src=\"{html.escape(src)}\" alt=\"{html.escape(title)}\">"

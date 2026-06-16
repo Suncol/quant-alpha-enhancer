@@ -1,10 +1,24 @@
 from __future__ import annotations
 
+import sys
+import zipfile
+
 import pandas as pd
 
 from analysis.build_return_y_neutralization_exposures import (
+    COL_AMOUNT,
+    COL_EXCHANGE,
+    COL_MARKET_CAP,
+    COL_MARKET_TYPE,
+    COL_STOCK_CODE,
+    COL_STOCK_INDUSTRY,
+    COL_TRADE_DATE,
+    COL_TS_CODE,
+    COL_TURNOVER,
+    COL_VOLUME,
     _build_static_metadata,
     _infer_board,
+    main as build_exposures_main,
 )
 
 
@@ -139,3 +153,85 @@ def test_build_static_metadata_maps_reference_main_by_exchange(tmp_path) -> None
 
     assert metadata.loc["600519", "board"] == "SSE_MAIN"
     assert metadata.loc["000001", "board"] == "SZSE_MAIN"
+
+
+def test_main_can_build_exposures_without_index_membership_features(tmp_path, monkeypatch) -> None:
+    return_y_path = tmp_path / "return_y.pkl"
+    pd.DataFrame(
+        [[0.01], [0.02]],
+        index=pd.to_datetime(["2017-01-03", "2017-01-04"]),
+        columns=["000001"],
+    ).to_pickle(return_y_path)
+
+    daily_root = tmp_path / "daily"
+    daily_root.mkdir()
+    pd.DataFrame(
+        [
+            {
+                COL_TS_CODE: "000001.SZ",
+                COL_STOCK_CODE: "000001",
+                COL_STOCK_INDUSTRY: "bank",
+                COL_MARKET_TYPE: "main",
+                COL_EXCHANGE: "SZSE",
+            }
+        ]
+    ).to_csv(daily_root / "股票列表.csv", index=False, encoding="utf-8-sig")
+    daily_rows = pd.DataFrame(
+        [
+            {
+                COL_STOCK_CODE: "000001",
+                COL_TRADE_DATE: 20170103,
+                COL_MARKET_CAP: 100.0,
+                COL_AMOUNT: 10.0,
+                COL_VOLUME: 1000.0,
+                COL_TURNOVER: 0.5,
+            },
+            {
+                COL_STOCK_CODE: "000001",
+                COL_TRADE_DATE: 20170104,
+                COL_MARKET_CAP: 101.0,
+                COL_AMOUNT: 11.0,
+                COL_VOLUME: 1100.0,
+                COL_TURNOVER: 0.6,
+            },
+        ]
+    )
+    with zipfile.ZipFile(daily_root / "每日指标.zip", "w") as zf:
+        zf.writestr("000001.csv", daily_rows.to_csv(index=False))
+
+    industry_board = tmp_path / "industry_board.txt"
+    industry_board.write_text("801020\tbank\t000001\tstock\n", encoding="gbk")
+
+    output_exposures = tmp_path / "exposures.pkl"
+    output_summary = tmp_path / "summary.json"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "build_return_y_neutralization_exposures.py",
+            "--return-y",
+            str(return_y_path),
+            "--daily-data-root",
+            str(daily_root),
+            "--industry-board",
+            str(industry_board),
+            "--output-exposures",
+            str(output_exposures),
+            "--output-summary",
+            str(output_summary),
+            "--start-date",
+            "2017-01-01",
+            "--min-rolling-observations",
+            "1",
+            "--exclude-index-membership-features",
+        ],
+    )
+
+    build_exposures_main()
+
+    exposures = pd.read_pickle(output_exposures)
+    summary = pd.read_json(output_summary, typ="series")
+    assert summary["effective_start_date"] == "2017-01-01"
+    assert summary["index_membership_features_enabled"] is False
+    assert summary["index_snapshot_ranges"] == {}
+    assert not {"is_csi300", "is_csi500", "is_csi1000", "is_csi2000"}.intersection(exposures.columns)

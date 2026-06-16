@@ -43,7 +43,7 @@ def main() -> None:
     parser.add_argument("--fold-assignments", required=True, type=Path)
     parser.add_argument("--training-data-summary", required=True, type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)
-    parser.add_argument("--target-col", default="y_rank_label")
+    parser.add_argument("--target-col", default="y_resid_fwd")
     parser.add_argument("--objective", default=DEFAULT_MODEL_PARAMS["objective"])
     parser.add_argument("--learning-rate", default=DEFAULT_MODEL_PARAMS["learning_rate"], type=float)
     parser.add_argument("--n-estimators", default=DEFAULT_MODEL_PARAMS["n_estimators"], type=int)
@@ -62,6 +62,42 @@ def main() -> None:
     parser.add_argument("--n-jobs", default=DEFAULT_MODEL_PARAMS["n_jobs"], type=int)
     parser.add_argument("--verbosity", default=DEFAULT_MODEL_PARAMS["verbosity"], type=int)
     parser.add_argument("--early-stopping-rounds", default=200, type=int)
+    parser.add_argument(
+        "--monotone-neutralized-alpha",
+        action="store_true",
+        help=(
+            "Apply +1 LightGBM monotone constraints only to neutralized alpha "
+            "rank/z signal features; all context and non-neutralized signal features remain unconstrained."
+        ),
+    )
+    parser.add_argument(
+        "--monotone-signal-features",
+        default="none",
+        choices=["none", "positive", "negative"],
+        help=(
+            "Apply a LightGBM monotone constraint to all model signal features. "
+            "Use 'positive' for raw alpha features where higher signal should not lower prediction "
+            "with all other features fixed."
+        ),
+    )
+    parser.add_argument(
+        "--monotone-positive-features",
+        nargs="*",
+        default=None,
+        help="Additional numeric model features to constrain with +1 monotonicity.",
+    )
+    parser.add_argument(
+        "--monotone-negative-features",
+        nargs="*",
+        default=None,
+        help="Additional numeric model features to constrain with -1 monotonicity.",
+    )
+    parser.add_argument(
+        "--exclude-features",
+        nargs="*",
+        default=None,
+        help="Model feature columns to remove from feature_roles before training.",
+    )
     parser.add_argument("--fold-ids", nargs="*", type=int, default=None)
     args = parser.parse_args()
 
@@ -102,6 +138,11 @@ def main() -> None:
         training_metadata=training_data_summary.get("metadata"),
         training_data_summary=training_data_summary,
         training_data_summary_path=args.training_data_summary,
+        monotone_neutralized_alpha=args.monotone_neutralized_alpha,
+        monotone_signal_features=args.monotone_signal_features,
+        monotone_positive_features=args.monotone_positive_features,
+        monotone_negative_features=args.monotone_negative_features,
+        exclude_features=args.exclude_features,
     )
     print(json.dumps(result["summary"], ensure_ascii=False, indent=2))
 
@@ -112,7 +153,7 @@ def train_placeholder_lgbm_models(
     fold_assignments: pd.DataFrame,
     feature_roles: dict[str, list[str]],
     output_dir: Path,
-    target_col: str = "y_rank_label",
+    target_col: str = "y_resid_fwd",
     model_params: dict[str, Any] | None = None,
     model_factory: Callable[..., Any] | None = None,
     early_stopping_rounds: int = 200,
@@ -120,10 +161,19 @@ def train_placeholder_lgbm_models(
     training_metadata: dict[str, Any] | None = None,
     training_data_summary: dict[str, Any] | None = None,
     training_data_summary_path: Path | None = None,
+    monotone_neutralized_alpha: bool = False,
+    monotone_signal_features: str = "none",
+    monotone_positive_features: list[str] | None = None,
+    monotone_negative_features: list[str] | None = None,
+    exclude_features: list[str] | None = None,
 ) -> dict[str, Any]:
     prepared_panel = _prepare_panel(panel)
     prepared_folds = _prepare_fold_assignments(fold_assignments)
-    feature_contract = _feature_contract(feature_roles)
+    effective_feature_roles, feature_exclusion = _feature_roles_after_exclusion(
+        feature_roles,
+        exclude_features=exclude_features,
+    )
+    feature_contract = _feature_contract(effective_feature_roles)
     model_feature_roles = feature_contract["feature_roles"]
     features = feature_contract["feature_columns"]
     signal_features = feature_contract["signal_features"]
@@ -138,12 +188,71 @@ def train_placeholder_lgbm_models(
         target_col,
         target_columns=feature_contract["targets"],
     )
+    evaluation_target_col = target_col
 
     if model_factory is None:
         model_factory = _lightgbm_model_factory
+    managed_monotone_requested = (
+        monotone_neutralized_alpha
+        or monotone_signal_features != "none"
+        or bool(monotone_positive_features)
+        or bool(monotone_negative_features)
+    )
+    if managed_monotone_requested and model_params and "monotone_constraints" in model_params:
+        raise ValueError(
+            "model_params must not define monotone_constraints when "
+            "a managed monotone constraint policy is requested; use one monotonicity source so "
+            "the training contract is explicit."
+        )
+    if monotone_neutralized_alpha and (
+        monotone_signal_features != "none"
+        or bool(monotone_positive_features)
+        or bool(monotone_negative_features)
+    ):
+        raise ValueError(
+            "monotone_neutralized_alpha cannot be combined with monotone_signal_features or explicit "
+            "monotone feature lists; choose one managed monotone constraint policy."
+        )
     params = dict(DEFAULT_MODEL_PARAMS)
     if model_params:
         params.update(model_params)
+    monotone_policy = "none"
+    monotone_enabled = False
+    if monotone_neutralized_alpha:
+        monotone_constraints = _neutralized_alpha_monotone_constraints(
+            features,
+            signal_features=signal_features,
+        )
+        if not any(monotone_constraints):
+            raise ValueError(
+                "monotone_neutralized_alpha=True requires at least one signal feature ending "
+                "with '_neutralized_rank' or '_neutralized_z'."
+            )
+        params["monotone_constraints"] = monotone_constraints
+        monotone_policy = "positive_on_neutralized_alpha_rank_z_only"
+        monotone_enabled = True
+    elif managed_monotone_requested:
+        monotone_constraints, monotone_policy = _signal_monotone_constraints(
+            features,
+            signal_features=signal_features,
+            categorical_features=categorical_features,
+            monotone_signal_features=monotone_signal_features,
+            monotone_positive_features=monotone_positive_features or [],
+            monotone_negative_features=monotone_negative_features or [],
+        )
+        if not any(monotone_constraints):
+            raise ValueError("Managed monotone constraint policy produced no non-zero constraints.")
+        params["monotone_constraints"] = monotone_constraints
+        monotone_enabled = True
+    elif "monotone_constraints" in params:
+        monotone_policy = "model_params_manual"
+        monotone_enabled = any(int(value) != 0 for value in params["monotone_constraints"])
+    monotone_constraint_summary = _monotone_constraint_summary(
+        features,
+        params.get("monotone_constraints"),
+        enabled=monotone_enabled,
+        policy=monotone_policy,
+    )
 
     selected_fold_ids = sorted(prepared_folds["fold_id"].unique().tolist())
     if fold_ids is not None:
@@ -223,30 +332,28 @@ def train_placeholder_lgbm_models(
             context_matrix = _make_context_only_matrix(matrix, signal_features)
             context_predictions = _predict_model(model, context_matrix)
             marginal_score = direct_predictions - context_predictions
-            prediction_frame = pd.DataFrame(
-                {
-                    "fold_id": int(fold_id),
-                    "split": split,
-                    "date": frame["date"].to_numpy(),
-                    "stock_code": frame["stock_code"].astype(str).to_numpy(),
-                    target_col: frame[target_col].astype(float).to_numpy(),
-                    "y_true": frame[target_col].astype(float).to_numpy(),
-                    "y_resid_fwd": frame["y_resid_fwd"].astype(float).to_numpy()
-                    if "y_resid_fwd" in frame
-                    else np.nan,
-                    "sample_weight": frame["sample_weight"].astype(float).to_numpy(),
-                    "pred_direct": direct_predictions,
-                    "pred_context_only": context_predictions,
-                    "score_marginal": marginal_score,
-                }
-            )
+            prediction_data = {
+                "fold_id": int(fold_id),
+                "split": split,
+                "date": frame["date"].to_numpy(),
+                "stock_code": frame["stock_code"].astype(str).to_numpy(),
+                target_col: frame[target_col].astype(float).to_numpy(),
+                "y_true": frame[target_col].astype(float).to_numpy(),
+                "sample_weight": frame["sample_weight"].astype(float).to_numpy(),
+                "pred_direct": direct_predictions,
+                "pred_context_only": context_predictions,
+                "score_marginal": marginal_score,
+            }
+            if target_col != "y_resid_fwd" and "y_resid_fwd" in frame:
+                prediction_data["y_resid_fwd"] = frame["y_resid_fwd"].astype(float).to_numpy()
+            prediction_frame = pd.DataFrame(prediction_data)
             prediction_frame["score_marginal_z"] = (
                 prediction_frame.groupby("date", group_keys=False)["score_marginal"]
                 .transform(_robust_zscore_series)
                 .astype(float)
             )
             prediction_frames.append(prediction_frame)
-            metric_target_col = "y_resid_fwd" if "y_resid_fwd" in prediction_frame.columns else "y_true"
+            metric_target_col = evaluation_target_col
             for prediction_col in ("pred_direct", "score_marginal", "score_marginal_z"):
                 split_metrics = compute_daily_prediction_metrics(
                     prediction_frame,
@@ -295,10 +402,12 @@ def train_placeholder_lgbm_models(
                     "context_only_zeroed_features": signal_features,
                     "target_col": target_col,
                     "fit_target_col": target_col,
-                    "evaluation_target_col": "y_resid_fwd",
+                    "evaluation_target_col": evaluation_target_col,
                     "training_metadata": run_metadata,
                     "source_training_data_summary": source_training_data_summary,
                     "model_params": params,
+                    "monotone_constraints": monotone_constraint_summary,
+                    "feature_exclusion": feature_exclusion,
                     "score_columns": [
                         "pred_direct",
                         "pred_context_only",
@@ -339,8 +448,8 @@ def train_placeholder_lgbm_models(
         training_panel=prepared_panel,
         output_dir=detailed_metrics_dir,
         score_cols=["pred_direct", "score_marginal", "score_marginal_z"],
-        target_col="y_resid_fwd",
-        spread_target_col="y_resid_fwd",
+        target_col=evaluation_target_col,
+        spread_target_col=evaluation_target_col,
         top_bottom_quantiles=10,
         condition_bucket_count=3,
         min_group_obs=2,
@@ -356,7 +465,7 @@ def train_placeholder_lgbm_models(
         "fold_count": int(len(selected_fold_ids)),
         "target_col": target_col,
         "fit_target_col": target_col,
-        "evaluation_target_col": "y_resid_fwd",
+        "evaluation_target_col": evaluation_target_col,
         "feature_roles": model_feature_roles,
         "feature_columns": features,
         "signal_features": signal_features,
@@ -369,6 +478,8 @@ def train_placeholder_lgbm_models(
         "source_training_data_summary": source_training_data_summary,
         "score_columns": ["pred_direct", "pred_context_only", "score_marginal", "score_marginal_z"],
         "model_params": params,
+        "monotone_constraints": monotone_constraint_summary,
+        "feature_exclusion": feature_exclusion,
         "early_stopping_rounds": int(early_stopping_rounds),
         "folds": fold_summaries,
         "model_diagnostics": _summarize_tree_diagnostics(fold_summaries),
@@ -387,7 +498,7 @@ def train_placeholder_lgbm_models(
             "charts": _path_for_summary(charts_dir),
             "report": _path_for_summary(report_path),
         },
-        "notes": _training_notes(run_metadata),
+        "notes": _training_notes(run_metadata, target_col=evaluation_target_col),
     }
     (output_dir / "training_summary.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2) + "\n",
@@ -441,14 +552,14 @@ def _training_metadata(
     return metadata
 
 
-def _training_notes(metadata: dict[str, Any]) -> list[str]:
+def _training_notes(metadata: dict[str, Any], *, target_col: str) -> list[str]:
     notes = [
         "Each fold is trained only on dates marked train in fold_assignments.",
         "Validation dates are used only as eval_set for early stopping.",
         "Test dates are used only for prediction and metrics.",
         "score_marginal = pred_direct - pred_context_only subtracts a zero-signal baseline prediction.",
-        "Compact metrics, detailed evaluation, and charts use y_resid_fwd as the realized-return target.",
-        "The current centered alpha rank convention uses neutral alpha values of 0.0.",
+        f"Compact metrics, detailed evaluation, and charts use {target_col} as the realized target.",
+        "The current centered signal rank/z convention uses neutral signal values of 0.0.",
     ]
     if metadata.get("alpha_is_real") is True:
         notes.append(
@@ -570,6 +681,192 @@ def _feature_columns(feature_roles: dict[str, list[str]]) -> list[str]:
     return _feature_contract(feature_roles)["feature_columns"]
 
 
+def _neutralized_alpha_monotone_constraints(
+    features: list[str],
+    *,
+    signal_features: list[str],
+) -> list[int]:
+    signal_feature_set = set(signal_features)
+    return [
+        1 if feature in signal_feature_set and _is_neutralized_alpha_rank_z_feature(feature) else 0
+        for feature in features
+    ]
+
+
+def _is_neutralized_alpha_rank_z_feature(feature: str) -> bool:
+    return feature.endswith("_neutralized_rank") or feature.endswith("_neutralized_z")
+
+
+def _signal_monotone_constraints(
+    features: list[str],
+    *,
+    signal_features: list[str],
+    categorical_features: list[str],
+    monotone_signal_features: str,
+    monotone_positive_features: list[str],
+    monotone_negative_features: list[str],
+) -> tuple[list[int], str]:
+    if monotone_signal_features not in {"none", "positive", "negative"}:
+        raise ValueError(
+            "monotone_signal_features must be one of 'none', 'positive', or 'negative'."
+        )
+    feature_set = set(features)
+    categorical_set = set(categorical_features)
+    constraints_by_feature = {feature: 0 for feature in features}
+
+    if monotone_signal_features in {"positive", "negative"}:
+        signal_constraint = 1 if monotone_signal_features == "positive" else -1
+        for feature in signal_features:
+            _assign_monotone_constraint(
+                constraints_by_feature,
+                feature,
+                signal_constraint,
+                feature_set=feature_set,
+                categorical_set=categorical_set,
+            )
+
+    for feature in monotone_positive_features:
+        _assign_monotone_constraint(
+            constraints_by_feature,
+            str(feature),
+            1,
+            feature_set=feature_set,
+            categorical_set=categorical_set,
+        )
+    for feature in monotone_negative_features:
+        _assign_monotone_constraint(
+            constraints_by_feature,
+            str(feature),
+            -1,
+            feature_set=feature_set,
+            categorical_set=categorical_set,
+        )
+
+    if monotone_signal_features == "positive" and not monotone_positive_features and not monotone_negative_features:
+        policy = "positive_on_signal_features"
+    elif monotone_signal_features == "negative" and not monotone_positive_features and not monotone_negative_features:
+        policy = "negative_on_signal_features"
+    elif monotone_signal_features == "none":
+        policy = "explicit_feature_monotone_constraints"
+    else:
+        policy = "signal_features_plus_explicit_feature_constraints"
+
+    return [constraints_by_feature[feature] for feature in features], policy
+
+
+def _assign_monotone_constraint(
+    constraints_by_feature: dict[str, int],
+    feature: str,
+    constraint: int,
+    *,
+    feature_set: set[str],
+    categorical_set: set[str],
+) -> None:
+    if feature not in feature_set:
+        raise ValueError(f"Monotone constraint feature {feature!r} is not in feature_columns.")
+    if feature in categorical_set:
+        raise ValueError(f"Categorical features cannot have monotone constraints: {feature!r}.")
+    if feature.startswith("y_") or feature in {"date", "stock_code", "sample_weight", "y_true"}:
+        raise ValueError(f"Leakage-prone columns cannot have monotone constraints: {feature!r}.")
+    existing = constraints_by_feature[feature]
+    if existing not in {0, constraint}:
+        raise ValueError(
+            f"Feature {feature!r} has conflicting monotone constraints: {existing} and {constraint}."
+        )
+    constraints_by_feature[feature] = int(constraint)
+
+
+def _monotone_constraint_summary(
+    features: list[str],
+    constraints: Any,
+    *,
+    enabled: bool,
+    policy: str,
+) -> dict[str, Any]:
+    if constraints is None:
+        constraint_values = [0 for _ in features]
+    else:
+        constraint_values = [int(value) for value in constraints]
+    if len(constraint_values) != len(features):
+        raise ValueError(
+            "monotone_constraints length must match feature_columns length: "
+            f"{len(constraint_values)} != {len(features)}."
+        )
+    constrained_features = [
+        feature
+        for feature, constraint in zip(features, constraint_values, strict=True)
+        if constraint != 0
+    ]
+    return {
+        "enabled": bool(enabled),
+        "policy": policy,
+        "positive_constraint_value": 1,
+        "negative_constraint_value": -1,
+        "constrained_features": constrained_features,
+        "constraints_by_feature": dict(zip(features, constraint_values, strict=True)),
+        "semantic_note": (
+            "LightGBM monotone constraints enforce partial monotonicity while all other "
+            "features are fixed; they do not preserve global cross-context ranking."
+        ),
+    }
+
+
+def _feature_roles_after_exclusion(
+    feature_roles: dict[str, list[str]],
+    *,
+    exclude_features: list[str] | None,
+) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
+    requested = _dedupe_feature_list(exclude_features or [])
+    roles = {str(role): _feature_role_list(feature_roles, str(role)) for role in feature_roles}
+    if not requested:
+        return roles, {
+            "requested_exclude_features": [],
+            "excluded_model_features": [],
+        }
+
+    model_role_names = (
+        "signal_features",
+        "alpha_placeholder",
+        "condition_categorical",
+        "condition_continuous",
+    )
+    model_features = {
+        feature
+        for role_name in model_role_names
+        for feature in _feature_role_list(feature_roles, role_name)
+    }
+    missing = [feature for feature in requested if feature not in model_features]
+    if missing:
+        raise ValueError(f"exclude_features are not declared model features: {missing}")
+
+    excluded_set = set(requested)
+    for role_name in model_role_names:
+        if role_name in roles:
+            roles[role_name] = [
+                feature for feature in roles[role_name] if feature not in excluded_set
+            ]
+
+    excluded_from_model = roles.get("excluded_from_model", [])
+    for feature in requested:
+        if feature not in excluded_from_model:
+            excluded_from_model.append(feature)
+    roles["excluded_from_model"] = excluded_from_model
+
+    return roles, {
+        "requested_exclude_features": requested,
+        "excluded_model_features": requested,
+    }
+
+
+def _dedupe_feature_list(features: list[str]) -> list[str]:
+    result: list[str] = []
+    for feature in features:
+        text = str(feature).strip()
+        if text and text not in result:
+            result.append(text)
+    return result
+
+
 def _feature_contract(feature_roles: dict[str, list[str]]) -> dict[str, Any]:
     legacy_signal_features = _feature_role_list(feature_roles, "alpha_placeholder")
     signal_alias_features = _feature_role_list(feature_roles, "signal_features")
@@ -665,7 +962,16 @@ def _validate_training_inputs(
     missing_categorical = sorted(set(categorical_features).difference(features))
     if missing_categorical:
         raise ValueError(f"Categorical features are not in the feature set: {missing_categorical}")
-    forbidden = {"date", "stock_code", "sample_weight", "y_rank_label", "y_resid_fwd"}
+    target_like_columns = {str(column) for column in panel.columns if str(column).startswith("y_")}
+    forbidden = {
+        "date",
+        "stock_code",
+        "sample_weight",
+        "y_true",
+        target_col,
+        *target_columns,
+        *target_like_columns,
+    }
     leakage = sorted(set(features).intersection(forbidden))
     if leakage:
         raise ValueError(f"Leakage-prone columns cannot be model features: {leakage}")

@@ -86,7 +86,7 @@ def main() -> None:
     )
     parser.add_argument("--return-y", required=True, type=Path)
     parser.add_argument("--daily-data-root", required=True, type=Path)
-    parser.add_argument("--index-data-root", required=True, type=Path)
+    parser.add_argument("--index-data-root", default=None, type=Path)
     parser.add_argument("--industry-board", required=True, type=Path)
     parser.add_argument(
         "--listing-board-reference",
@@ -101,7 +101,18 @@ def main() -> None:
     parser.add_argument("--output-summary", required=True, type=Path)
     parser.add_argument("--start-date", default="2023-08-11")
     parser.add_argument("--min-rolling-observations", default=5, type=int)
+    parser.add_argument(
+        "--exclude-index-membership-features",
+        action="store_true",
+        help=(
+            "Do not read index component snapshots or output is_csi* membership features. "
+            "The effective start date is then controlled only by --start-date and return_y coverage."
+        ),
+    )
     args = parser.parse_args()
+    include_index_membership_features = not args.exclude_index_membership_features
+    if include_index_membership_features and args.index_data_root is None:
+        parser.error("--index-data-root is required unless --exclude-index-membership-features is set.")
 
     return_y = pd.read_pickle(args.return_y)
     if not isinstance(return_y, pd.DataFrame):
@@ -112,19 +123,23 @@ def main() -> None:
     stock_codes = sorted({_normalize_stock_code(column) for column in return_y.columns})
     stock_codes = [code for code in stock_codes if code]
 
-    index_snapshots = {
-        column: _read_index_snapshots(args.index_data_root / directory, member_name)
-        for column, (directory, member_name) in INDEX_SPECS.items()
-    }
-    first_complete_snapshot = max(
-        min(snapshots) for snapshots in index_snapshots.values() if snapshots
-    )
-    effective_start = max(requested_start, first_complete_snapshot)
+    if include_index_membership_features:
+        index_snapshots = {
+            column: _read_index_snapshots(args.index_data_root / directory, member_name)
+            for column, (directory, member_name) in INDEX_SPECS.items()
+        }
+        first_complete_snapshot = max(
+            min(snapshots) for snapshots in index_snapshots.values() if snapshots
+        )
+        effective_start = max(requested_start, first_complete_snapshot)
+    else:
+        index_snapshots = {}
+        effective_start = requested_start
     required_dates = pd.DatetimeIndex(
         sorted(date for date in return_dates.unique() if date >= effective_start)
     )
     if required_dates.empty:
-        raise ValueError("No return_y dates remain after applying start date and index snapshots.")
+        raise ValueError("No return_y dates remain after applying the effective start date.")
 
     metadata = _build_static_metadata(
         args.daily_data_root / "\u80a1\u7968\u5217\u8868.csv",
@@ -145,17 +160,14 @@ def main() -> None:
     exposures["industry"] = exposures["industry"].fillna("unknown_industry")
     exposures["board"] = exposures["board"].fillna(UNKNOWN_BOARD)
     exposures["board_source"] = exposures["board_source"].fillna("unknown")
-    exposures = _attach_index_flags(exposures, index_snapshots)
+    if include_index_membership_features:
+        exposures = _attach_index_flags(exposures, index_snapshots)
 
     output_columns = [
         "date",
         "stock_code",
         "industry",
         "board",
-        "is_csi300",
-        "is_csi500",
-        "is_csi1000",
-        "is_csi2000",
         "market_cap",
         "amount_k",
         "turnover",
@@ -163,6 +175,8 @@ def main() -> None:
         "logAmount20",
         "turnover20",
     ]
+    if include_index_membership_features:
+        output_columns[4:4] = list(INDEX_SPECS)
     exposures = exposures.sort_values(["date", "stock_code"]).reset_index(drop=True)
 
     args.output_exposures.parent.mkdir(parents=True, exist_ok=True)
@@ -203,6 +217,7 @@ def main() -> None:
         "singleton_board_category_date_count": singleton_board_summary["date_count"],
         "singleton_board_categories_by_date_sample": singleton_board_summary["sample"],
         "unexpected_board_values": unexpected_board_values,
+        "index_membership_features_enabled": bool(include_index_membership_features),
         "index_snapshot_ranges": {
             column: {
                 "snapshot_count": int(len(snapshots)),
@@ -213,7 +228,7 @@ def main() -> None:
         },
         "index_member_row_counts": {
             column: int(exposures[column].sum()) for column in INDEX_SPECS
-        },
+        } if include_index_membership_features else {},
     }
     args.output_summary.write_text(
         json.dumps(summary, ensure_ascii=False, indent=2) + "\n",

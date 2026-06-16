@@ -152,6 +152,24 @@ REAL_CONTINUOUS_FEATURES = [
     "log_mcap_z",
     "mcap_rank",
 ]
+RAW_RETURN_TARGET = "y_return_hfq_adj_fwd"
+RAW_RETURN_RANK_LABEL = "y_return_rank_label"
+
+NEUTRALIZED_SIGNAL_FEATURES = [
+    "factor_sss_dx_10_value_neutralized_rank",
+    "factor_sss_dx_10_value_neutralized_z",
+    "factor_sss_dx_10_rank_neutralized_rank",
+    "factor_sss_dx_10_rank_neutralized_z",
+    "close_rank",
+    "close_z",
+]
+
+NEUTRALIZED_ALPHA_MONOTONE_FEATURES = [
+    "factor_sss_dx_10_value_neutralized_rank",
+    "factor_sss_dx_10_value_neutralized_z",
+    "factor_sss_dx_10_rank_neutralized_rank",
+    "factor_sss_dx_10_rank_neutralized_z",
+]
 
 
 def _make_real_alpha_feature_panel() -> pd.DataFrame:
@@ -251,6 +269,56 @@ def _make_real_alpha_feature_roles(*, use_signal_alias: bool = False) -> dict[st
     }
 
 
+def _make_non_neutralized_raw_return_panel() -> pd.DataFrame:
+    frame = _make_real_alpha_feature_panel().copy()
+    frame[RAW_RETURN_TARGET] = (
+        0.02
+        + frame["date"].rank(method="dense").astype(float) / 1000.0
+        - frame["stock_code"].astype(str).str[-1].astype(float) / 100.0
+    )
+    frame[RAW_RETURN_RANK_LABEL] = frame.groupby("date")[RAW_RETURN_TARGET].rank(
+        method="average",
+        pct=True,
+    )
+    return frame.drop(columns=["y_resid_fwd", "y_rank_label"])
+
+
+def _make_non_neutralized_raw_return_roles() -> dict[str, list[str]]:
+    roles = _make_real_alpha_feature_roles(use_signal_alias=True)
+    roles["targets"] = [RAW_RETURN_TARGET]
+    roles["excluded_from_model"] = [
+        column
+        for column in roles["excluded_from_model"]
+        if column not in {"y_resid_fwd", "y_rank_label"}
+    ] + [RAW_RETURN_TARGET, RAW_RETURN_RANK_LABEL]
+    return roles
+
+
+def _make_neutralized_alpha_feature_panel() -> pd.DataFrame:
+    frame = _make_real_alpha_feature_panel()
+    source_columns = [
+        "factor_sss_dx_10_rank",
+        "factor_sss_dx_10_z",
+        "factor_sss_dx_10_rank",
+        "factor_sss_dx_10_z",
+        "close_rank",
+        "close_z",
+    ]
+    for target_column, source_column in zip(
+        NEUTRALIZED_SIGNAL_FEATURES,
+        source_columns,
+        strict=True,
+    ):
+        frame[target_column] = frame[source_column]
+    return frame
+
+
+def _make_neutralized_alpha_feature_roles() -> dict[str, list[str]]:
+    roles = _make_real_alpha_feature_roles()
+    roles["alpha_placeholder"] = NEUTRALIZED_SIGNAL_FEATURES
+    return roles
+
+
 def _make_real_alpha_training_metadata() -> dict[str, object]:
     return {
         "signal_stage": "real_alpha_kline_feature_panel",
@@ -309,8 +377,8 @@ def test_train_placeholder_lgbm_models_uses_only_train_for_fit_and_test_for_pred
     assert model.params["cat_l2"] == 3.0
     assert model.params["cat_smooth"] == 7.0
     assert model.params["verbosity"] == -1
-    assert set(model.fit_y.to_numpy()) == {0.0, 1.0, 2.0, 10.0, 11.0, 12.0}
-    assert set(model.valid_y.to_numpy()) == {20.0, 21.0, 22.0, 30.0, 31.0, 32.0}
+    assert set(model.fit_y.to_numpy()) == {0.0, -0.01, -0.02, 0.1, 0.09, 0.08}
+    assert set(model.valid_y.to_numpy()) == {0.2, 0.19, 0.18, 0.3, 0.29, 0.28}
     assert len(model.fit_X) == 6
     assert len(model.valid_X) == 6
     assert "date" not in model.fit_X.columns
@@ -331,7 +399,14 @@ def test_train_placeholder_lgbm_models_uses_only_train_for_fit_and_test_for_pred
     predictions = result["predictions"]
     assert set(predictions["split"]) == {"train", "valid", "test"}
     assert len(predictions[predictions["split"].eq("test")]) == 6
-    assert {60.0, 61.0, 62.0}.isdisjoint(set(predictions["y_true"]))
+    assert set(predictions.loc[predictions["split"].eq("test"), "y_true"]) == {
+        0.4,
+        0.39,
+        0.38,
+        0.5,
+        0.49,
+        0.48,
+    }
     assert {"pred_direct", "pred_context_only", "score_marginal", "score_marginal_z"}.issubset(
         predictions.columns
     )
@@ -369,6 +444,9 @@ def test_train_placeholder_lgbm_models_uses_only_train_for_fit_and_test_for_pred
     assert (tmp_path / "charts" / "feature_gain_top.png").exists()
     assert (tmp_path / "training_summary.json").exists()
     summary = json.loads((tmp_path / "training_summary.json").read_text(encoding="utf-8"))
+    assert summary["target_col"] == "y_resid_fwd"
+    assert summary["fit_target_col"] == "y_resid_fwd"
+    assert summary["evaluation_target_col"] == "y_resid_fwd"
     assert summary["metadata"]["model_form"] == "p = g(alpha_placeholder, c)"
     assert summary["metadata"]["alpha_is_real"] is False
     assert summary["model_diagnostics"]["available"] is False
@@ -442,6 +520,267 @@ def test_train_real_alpha_feature_panel_uses_signal_kline_and_context_contract(
     assert result["summary"]["context_only_zeroed_features"] == REAL_SIGNAL_FEATURES
     assert result["summary"]["metadata"]["signal_feature_role"] == "signal_features"
     assert result["summary"]["metadata"]["context_only_policy"] == "zero_signal_features_at_centered_neutral"
+
+
+def test_train_real_alpha_can_fit_and_evaluate_non_neutralized_raw_return_target(
+    tmp_path: Path,
+) -> None:
+    RecordingRegressor.instances.clear()
+    panel = _make_non_neutralized_raw_return_panel()
+
+    result = train_placeholder_lgbm_models(
+        panel=panel,
+        fold_assignments=_make_real_alpha_fold_assignments(),
+        feature_roles=_make_non_neutralized_raw_return_roles(),
+        output_dir=tmp_path,
+        target_col=RAW_RETURN_TARGET,
+        model_factory=RecordingRegressor,
+        model_params={"n_estimators": 10, "verbosity": -1},
+        training_metadata={
+            **_make_real_alpha_training_metadata(),
+            "signal_stage": "non_neutralized_real_alpha_raw_return_panel",
+            "optimization_objective": "raw_forward_return",
+            "target_col": RAW_RETURN_TARGET,
+            "neutralization_policy": {
+                "return_y": "not_neutralized",
+                "alpha_signal": "not_neutralized",
+            },
+        },
+    )
+
+    model = RecordingRegressor.instances[0]
+    train_expected = (
+        panel[panel["date"].isin(pd.to_datetime(["2024-01-02", "2024-01-03"]))]
+        .sort_values(["date", "stock_code"])[RAW_RETURN_TARGET]
+        .to_numpy(dtype=float)
+    )
+    valid_expected = (
+        panel[panel["date"].isin(pd.to_datetime(["2024-01-04", "2024-01-05"]))]
+        .sort_values(["date", "stock_code"])[RAW_RETURN_TARGET]
+        .to_numpy(dtype=float)
+    )
+    assert np.allclose(model.fit_y.to_numpy(dtype=float), train_expected)
+    assert np.allclose(model.valid_y.to_numpy(dtype=float), valid_expected)
+    assert RAW_RETURN_TARGET not in model.fit_X.columns
+    assert RAW_RETURN_RANK_LABEL not in model.fit_X.columns
+    assert "y_resid_fwd" not in model.fit_X.columns
+
+    predictions = result["predictions"]
+    assert RAW_RETURN_TARGET in predictions.columns
+    assert "y_true" in predictions.columns
+    assert "y_resid_fwd" not in predictions.columns
+    assert np.allclose(predictions[RAW_RETURN_TARGET], predictions["y_true"])
+    assert set(result["metrics"]["metric_target_col"]) == {RAW_RETURN_TARGET}
+
+    train_predictions = predictions[predictions["split"].eq("train")]
+    expected_raw_metrics = compute_daily_prediction_metrics(
+        train_predictions,
+        target_col=RAW_RETURN_TARGET,
+        pred_col="pred_direct",
+    )
+    train_metric = result["metrics"][
+        result["metrics"]["split"].eq("train")
+        & result["metrics"]["prediction_col"].eq("pred_direct")
+    ].iloc[0]
+    assert np.isclose(train_metric["mean_ic"], expected_raw_metrics["mean_ic"])
+
+    summary = json.loads((tmp_path / "training_summary.json").read_text(encoding="utf-8"))
+    assert summary["target_col"] == RAW_RETURN_TARGET
+    assert summary["fit_target_col"] == RAW_RETURN_TARGET
+    assert summary["evaluation_target_col"] == RAW_RETURN_TARGET
+    assert summary["detailed_evaluation"]["metric_contract"]["target_col"] == RAW_RETURN_TARGET
+    assert summary["detailed_evaluation"]["metric_contract"]["spread_target_col"] == RAW_RETURN_TARGET
+    assert summary["metadata"]["optimization_objective"] == "raw_forward_return"
+    assert summary["metadata"]["neutralization_policy"] == {
+        "return_y": "not_neutralized",
+        "alpha_signal": "not_neutralized",
+    }
+
+    evaluation_summary = json.loads(
+        (tmp_path / "detailed_metrics" / "evaluation_summary.json").read_text(encoding="utf-8")
+    )
+    assert evaluation_summary["metric_contract"]["target_col"] == RAW_RETURN_TARGET
+    assert evaluation_summary["metric_contract"]["spread_target_col"] == RAW_RETURN_TARGET
+    metadata = json.loads((tmp_path / "models" / "fold_1_metadata.json").read_text(encoding="utf-8"))
+    assert metadata["target_col"] == RAW_RETURN_TARGET
+    assert metadata["fit_target_col"] == RAW_RETURN_TARGET
+    assert metadata["evaluation_target_col"] == RAW_RETURN_TARGET
+
+
+def test_train_monotone_neutralized_alpha_constrains_only_neutralized_alpha_features(
+    tmp_path: Path,
+) -> None:
+    RecordingRegressor.instances.clear()
+
+    result = train_placeholder_lgbm_models(
+        panel=_make_neutralized_alpha_feature_panel(),
+        fold_assignments=_make_real_alpha_fold_assignments(),
+        feature_roles=_make_neutralized_alpha_feature_roles(),
+        output_dir=tmp_path,
+        model_factory=RecordingRegressor,
+        model_params={"n_estimators": 10, "verbosity": -1},
+        training_metadata=_make_real_alpha_training_metadata(),
+        monotone_neutralized_alpha=True,
+    )
+
+    expected_features = NEUTRALIZED_SIGNAL_FEATURES + REAL_CATEGORICAL_FEATURES + REAL_CONTINUOUS_FEATURES
+    expected_constraints = [
+        1 if feature in NEUTRALIZED_ALPHA_MONOTONE_FEATURES else 0
+        for feature in expected_features
+    ]
+
+    model = RecordingRegressor.instances[0]
+    assert model.feature_names_ == expected_features
+    assert model.params["monotone_constraints"] == expected_constraints
+    assert result["summary"]["model_params"]["monotone_constraints"] == expected_constraints
+    assert result["summary"]["monotone_constraints"] == {
+        "enabled": True,
+        "policy": "positive_on_neutralized_alpha_rank_z_only",
+        "positive_constraint_value": 1,
+        "negative_constraint_value": -1,
+        "constrained_features": NEUTRALIZED_ALPHA_MONOTONE_FEATURES,
+        "constraints_by_feature": dict(zip(expected_features, expected_constraints, strict=True)),
+        "semantic_note": (
+            "LightGBM monotone constraints enforce partial monotonicity while all other "
+            "features are fixed; they do not preserve global cross-context ranking."
+        ),
+    }
+
+    metadata = json.loads((tmp_path / "models" / "fold_1_metadata.json").read_text(encoding="utf-8"))
+    assert metadata["model_params"]["monotone_constraints"] == expected_constraints
+    assert metadata["monotone_constraints"] == result["summary"]["monotone_constraints"]
+
+
+def test_train_monotone_signal_features_constrains_raw_alpha_signal_features(
+    tmp_path: Path,
+) -> None:
+    RecordingRegressor.instances.clear()
+    feature_roles = _make_non_neutralized_raw_return_roles()
+    feature_roles["signal_features"] = ["factor_sss_dx_10_rank", "factor_sss_dx_10_z"]
+
+    result = train_placeholder_lgbm_models(
+        panel=_make_non_neutralized_raw_return_panel(),
+        fold_assignments=_make_real_alpha_fold_assignments(),
+        feature_roles=feature_roles,
+        output_dir=tmp_path,
+        target_col=RAW_RETURN_TARGET,
+        model_factory=RecordingRegressor,
+        model_params={"n_estimators": 10, "verbosity": -1},
+        training_metadata=_make_real_alpha_training_metadata(),
+        monotone_signal_features="positive",
+    )
+
+    expected_features = [
+        "factor_sss_dx_10_rank",
+        "factor_sss_dx_10_z",
+        *REAL_CATEGORICAL_FEATURES,
+        *REAL_CONTINUOUS_FEATURES,
+    ]
+    expected_constraints = [1, 1, *([0] * (len(expected_features) - 2))]
+
+    model = RecordingRegressor.instances[0]
+    assert model.feature_names_ == expected_features
+    assert model.params["monotone_constraints"] == expected_constraints
+    assert result["summary"]["model_params"]["monotone_constraints"] == expected_constraints
+    assert result["summary"]["monotone_constraints"] == {
+        "enabled": True,
+        "policy": "positive_on_signal_features",
+        "positive_constraint_value": 1,
+        "negative_constraint_value": -1,
+        "constrained_features": ["factor_sss_dx_10_rank", "factor_sss_dx_10_z"],
+        "constraints_by_feature": dict(zip(expected_features, expected_constraints, strict=True)),
+        "semantic_note": (
+            "LightGBM monotone constraints enforce partial monotonicity while all other "
+            "features are fixed; they do not preserve global cross-context ranking."
+        ),
+    }
+
+    metadata = json.loads((tmp_path / "models" / "fold_1_metadata.json").read_text(encoding="utf-8"))
+    assert metadata["model_params"]["monotone_constraints"] == expected_constraints
+    assert metadata["monotone_constraints"] == result["summary"]["monotone_constraints"]
+
+
+def test_train_can_exclude_model_features_before_contract_and_monotone_constraints(
+    tmp_path: Path,
+) -> None:
+    RecordingRegressor.instances.clear()
+    excluded_features = ["is_csi300", "is_csi500", "is_csi1000", "is_csi2000"]
+    feature_roles = _make_non_neutralized_raw_return_roles()
+    feature_roles["signal_features"] = ["factor_sss_dx_10_rank", "factor_sss_dx_10_z"]
+
+    result = train_placeholder_lgbm_models(
+        panel=_make_non_neutralized_raw_return_panel(),
+        fold_assignments=_make_real_alpha_fold_assignments(),
+        feature_roles=feature_roles,
+        output_dir=tmp_path,
+        target_col=RAW_RETURN_TARGET,
+        model_factory=RecordingRegressor,
+        model_params={"n_estimators": 10, "verbosity": -1},
+        training_metadata=_make_real_alpha_training_metadata(),
+        monotone_signal_features="positive",
+        exclude_features=excluded_features,
+    )
+
+    expected_features = [
+        "factor_sss_dx_10_rank",
+        "factor_sss_dx_10_z",
+        *REAL_CATEGORICAL_FEATURES,
+        "log_mcap_z",
+        "mcap_rank",
+    ]
+    expected_constraints = [1, 1, *([0] * (len(expected_features) - 2))]
+
+    model = RecordingRegressor.instances[0]
+    assert model.feature_names_ == expected_features
+    assert all(feature not in model.fit_X.columns for feature in excluded_features)
+    assert model.params["monotone_constraints"] == expected_constraints
+    assert result["summary"]["feature_columns"] == expected_features
+    assert result["summary"]["condition_continuous_features"] == ["log_mcap_z", "mcap_rank"]
+    assert result["summary"]["context_features"] == [
+        *REAL_CATEGORICAL_FEATURES,
+        "log_mcap_z",
+        "mcap_rank",
+    ]
+    assert result["summary"]["feature_exclusion"] == {
+        "requested_exclude_features": excluded_features,
+        "excluded_model_features": excluded_features,
+    }
+    assert all(
+        feature not in result["summary"]["monotone_constraints"]["constraints_by_feature"]
+        for feature in excluded_features
+    )
+
+    metadata = json.loads((tmp_path / "models" / "fold_1_metadata.json").read_text(encoding="utf-8"))
+    assert metadata["feature_columns"] == expected_features
+    assert metadata["feature_exclusion"] == result["summary"]["feature_exclusion"]
+
+
+def test_train_monotone_signal_features_rejects_manual_constraint_source_conflict(
+    tmp_path: Path,
+) -> None:
+    feature_roles = _make_non_neutralized_raw_return_roles()
+    feature_roles["signal_features"] = ["factor_sss_dx_10_rank", "factor_sss_dx_10_z"]
+
+    try:
+        train_placeholder_lgbm_models(
+            panel=_make_non_neutralized_raw_return_panel(),
+            fold_assignments=_make_real_alpha_fold_assignments(),
+            feature_roles=feature_roles,
+            output_dir=tmp_path,
+            target_col=RAW_RETURN_TARGET,
+            model_factory=RecordingRegressor,
+            model_params={
+                "n_estimators": 10,
+                "verbosity": -1,
+                "monotone_constraints": [0] * 12,
+            },
+            training_metadata=_make_real_alpha_training_metadata(),
+            monotone_signal_features="positive",
+        )
+    except ValueError as exc:
+        assert "model_params must not define monotone_constraints" in str(exc)
+    else:
+        raise AssertionError("Expected conflicting monotone constraint sources to raise ValueError")
 
 
 def test_train_real_alpha_uses_fold_local_weight_normalization(

@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from analysis.evaluate_lgbm_training_metrics import (
     build_feature_gain_artifacts,
     evaluate_model_predictions,
+    write_evaluation_html_report,
     write_model_evaluation_artifacts,
 )
 
@@ -144,6 +147,55 @@ def test_write_model_evaluation_artifacts_creates_reproducible_outputs(tmp_path:
     for output_path in loaded_summary["outputs"].values():
         assert not Path(output_path).is_absolute()
     assert summary["row_counts"]["overall_metrics"] == 1
+
+
+def test_html_report_uses_resolvable_paths_for_charts_saved_next_to_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    report_path = Path("analysis/outputs/run/training_report.html")
+    chart_path = Path("analysis/outputs/run/charts/overall_ic_rankic.png")
+    chart_path.parent.mkdir(parents=True, exist_ok=True)
+    chart_path.write_bytes(b"\x89PNG\r\n\x1a\n")
+
+    result = {
+        "overall_metrics": pd.DataFrame(
+            [
+                {
+                    "fold_id": 1,
+                    "split": "test",
+                    "split_order": 3,
+                    "score_col": "score",
+                    "mean_ic": 0.1,
+                    "mean_rankic": 0.2,
+                    "ic_positive_rate": 1.0,
+                    "date_count": 1,
+                }
+            ]
+        )
+    }
+    summary = {
+        "primary_score_col": "score",
+        "group_dimensions": [],
+        "outputs": {},
+        "metric_contract": {
+            "target_col": "y_true",
+            "spread_target_col": "y_true",
+        },
+    }
+
+    write_evaluation_html_report(
+        result,
+        summary,
+        report_path,
+        chart_outputs={"overall_ic_rankic": chart_path.as_posix()},
+    )
+
+    report_html = report_path.read_text(encoding="utf-8")
+    image_sources = re.findall(r'<img src="([^"]+)"', report_html)
+    assert image_sources == ["charts/overall_ic_rankic.png"]
+    for image_source in image_sources:
+        assert (report_path.parent / image_source).exists()
 
 
 def test_build_feature_gain_artifacts_computes_shares_roles_and_zero_gain() -> None:

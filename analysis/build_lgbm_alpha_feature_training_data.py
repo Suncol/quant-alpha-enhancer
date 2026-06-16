@@ -30,7 +30,11 @@ try:
         make_embargoed_dates,
         make_walk_forward_fold_assignments,
     )
-    from analysis.neutralize_return_y import centered_rank
+    from analysis.neutralize_return_y import (
+        BasicNeutralizationConfig,
+        centered_rank,
+        neutralize_return_y_matrix,
+    )
 except ModuleNotFoundError:  # Allows direct execution via python analysis/script.py.
     from build_lgbm_placeholder_training_data import (
         DEFAULT_INDEX_COLUMNS,
@@ -53,7 +57,11 @@ except ModuleNotFoundError:  # Allows direct execution via python analysis/scrip
         make_embargoed_dates,
         make_walk_forward_fold_assignments,
     )
-    from neutralize_return_y import centered_rank
+    from neutralize_return_y import (
+        BasicNeutralizationConfig,
+        centered_rank,
+        neutralize_return_y_matrix,
+    )
 
 
 @dataclass(frozen=True)
@@ -69,6 +77,11 @@ DEFAULT_SIGNAL_SPECS = (
     SignalTransformSpec("vol", "log1p_nonnegative"),
 )
 
+DEFAULT_LIQUIDITY_SIGNAL_NAMES = ("amo", "vol")
+DEFAULT_NO_LIQUIDITY_SIGNAL_SPECS = tuple(
+    spec for spec in DEFAULT_SIGNAL_SPECS if spec.name not in set(DEFAULT_LIQUIDITY_SIGNAL_NAMES)
+)
+
 DEFAULT_LIQUIDITY_CONTEXT_SPECS = (
     SignalTransformSpec("amount_k", "log1p_nonnegative"),
     SignalTransformSpec("turnover", "log1p_nonnegative"),
@@ -76,6 +89,8 @@ DEFAULT_LIQUIDITY_CONTEXT_SPECS = (
     SignalTransformSpec("logAmount20", "identity"),
     SignalTransformSpec("turnover20", "log1p_nonnegative"),
 )
+
+DEFAULT_ALPHA_SIGNAL_NAMES = ("factor_sss_dx_10",)
 
 
 def main() -> None:
@@ -89,9 +104,10 @@ def main() -> None:
     parser.add_argument("--y-resid", required=True, type=Path)
     parser.add_argument("--y-rank-label", required=True, type=Path)
     parser.add_argument("--factor-sss-dx-10-value", required=True, type=Path)
-    parser.add_argument("--amo-value", required=True, type=Path)
+    parser.add_argument("--factor-sss-dx-10-rank", default=None, type=Path)
+    parser.add_argument("--amo-value", default=None, type=Path)
     parser.add_argument("--close-value", required=True, type=Path)
-    parser.add_argument("--vol-value", required=True, type=Path)
+    parser.add_argument("--vol-value", default=None, type=Path)
     parser.add_argument("--output-panel", required=True, type=Path)
     parser.add_argument("--output-fold-assignments", required=True, type=Path)
     parser.add_argument("--output-summary", required=True, type=Path)
@@ -100,27 +116,76 @@ def main() -> None:
     parser.add_argument("--winsor-upper", default=0.99, type=float)
     parser.add_argument("--z-clip", default=5.0, type=float)
     parser.add_argument("--embargo-trading-days", default=2, type=int)
+    parser.add_argument(
+        "--neutralize-alpha-signal",
+        action="store_true",
+        help="Neutralize alpha value and rank inputs against same-date risk/style exposures before feature transforms.",
+    )
+    parser.add_argument(
+        "--exclude-liquidity-context-features",
+        action="store_true",
+        help="Exclude amount/turnover/ADV rank-z features from model roles and no-liquidity traceability output.",
+    )
+    parser.add_argument(
+        "--exclude-liquidity-signal-features",
+        action="store_true",
+        help="Exclude kline amount/volume proxy signals such as amo and vol from model roles and traceability output.",
+    )
+    parser.add_argument("--alpha-neutralization-ridge", default=1e-8, type=float)
+    parser.add_argument("--alpha-neutralization-min-obs", default=30, type=int)
+    parser.add_argument("--alpha-neutralization-min-obs-per-column-buffer", default=10, type=int)
     args = parser.parse_args()
 
     exposures = _read_frame(args.exposures)
     y_resid = _read_frame(args.y_resid)
     y_rank_label = _read_frame(args.y_rank_label)
-    signal_value_frames = {
+    signal_specs = (
+        DEFAULT_NO_LIQUIDITY_SIGNAL_SPECS
+        if args.exclude_liquidity_signal_features
+        else DEFAULT_SIGNAL_SPECS
+    )
+    required_signal_paths = {
         "factor_sss_dx_10": _read_frame(args.factor_sss_dx_10_value),
-        "amo": _read_frame(args.amo_value),
         "close": _read_frame(args.close_value),
-        "vol": _read_frame(args.vol_value),
     }
+    if not args.exclude_liquidity_signal_features:
+        missing_signal_paths = [
+            flag
+            for flag, path in (("--amo-value", args.amo_value), ("--vol-value", args.vol_value))
+            if path is None
+        ]
+        if missing_signal_paths:
+            parser.error(
+                "Missing required liquidity signal input(s) when --exclude-liquidity-signal-features is not set: "
+                + ", ".join(missing_signal_paths)
+            )
+        required_signal_paths["amo"] = _read_frame(args.amo_value)
+        required_signal_paths["vol"] = _read_frame(args.vol_value)
+    signal_value_frames = required_signal_paths
+    alpha_rank_frames = None
+    if args.factor_sss_dx_10_rank is not None:
+        alpha_rank_frames = {"factor_sss_dx_10": _read_frame(args.factor_sss_dx_10_rank)}
 
     summary = write_alpha_feature_training_data_artifacts(
         exposures=exposures,
         y_resid=y_resid,
         y_rank_label=y_rank_label,
         signal_value_frames=signal_value_frames,
+        alpha_rank_frames=alpha_rank_frames,
         output_panel=args.output_panel,
         output_fold_assignments=args.output_fold_assignments,
         output_summary=args.output_summary,
         diagnostics_dir=args.diagnostics_dir,
+        signal_specs=signal_specs,
+        neutralize_alpha_signal=args.neutralize_alpha_signal,
+        alpha_neutralization_config=BasicNeutralizationConfig(
+            ridge=args.alpha_neutralization_ridge,
+            winsor_lower=None,
+            winsor_upper=None,
+            min_obs=args.alpha_neutralization_min_obs,
+            min_obs_per_column_buffer=args.alpha_neutralization_min_obs_per_column_buffer,
+        ),
+        include_liquidity_context_features=not args.exclude_liquidity_context_features,
         winsor_lower=args.winsor_lower,
         winsor_upper=args.winsor_upper,
         z_clip=args.z_clip,
@@ -135,7 +200,12 @@ def build_alpha_feature_training_panel(
     y_rank_label: pd.DataFrame,
     *,
     signal_value_frames: Mapping[str, pd.DataFrame],
+    alpha_rank_frames: Mapping[str, pd.DataFrame] | None = None,
     signal_specs: Sequence[SignalTransformSpec] = DEFAULT_SIGNAL_SPECS,
+    neutralize_alpha_signal: bool = False,
+    alpha_signal_names: Sequence[str] = DEFAULT_ALPHA_SIGNAL_NAMES,
+    alpha_neutralization_config: BasicNeutralizationConfig | None = None,
+    include_liquidity_context_features: bool = True,
     winsor_lower: float = 0.01,
     winsor_upper: float = 0.99,
     z_clip: float = 5.0,
@@ -143,23 +213,54 @@ def build_alpha_feature_training_panel(
     _validate_winsor_config(winsor_lower, winsor_upper, z_clip)
     specs = tuple(signal_specs)
     _validate_signal_inputs(signal_value_frames, specs)
+    neutralized_alpha_names = tuple(alpha_signal_names) if neutralize_alpha_signal else ()
+    _validate_alpha_neutralization_inputs(
+        specs,
+        alpha_rank_frames,
+        neutralized_alpha_names,
+    )
 
-    context_frame = _prepare_context_exposures(exposures)
+    context_frame = _prepare_context_exposures(
+        exposures,
+        require_liquidity_context=include_liquidity_context_features,
+    )
+    alpha_neutralization = _neutralize_alpha_signal_inputs(
+        context_frame,
+        signal_value_frames=signal_value_frames,
+        alpha_rank_frames=alpha_rank_frames,
+        alpha_signal_names=neutralized_alpha_names,
+        config=alpha_neutralization_config,
+    )
     feature_frame, signal_diagnostics = _add_signal_raw_columns(
         context_frame,
         signal_value_frames=signal_value_frames,
+        alpha_rank_frames=alpha_rank_frames,
+        neutralized_alpha_value_frames=alpha_neutralization["value_frames"],
+        neutralized_alpha_rank_frames=alpha_neutralization["rank_frames"],
         signal_specs=specs,
+        neutralized_alpha_signal_names=neutralized_alpha_names,
     )
     feature_frame = _add_alpha_feature_columns(
         feature_frame,
         signal_specs=specs,
+        neutralized_alpha_signal_names=neutralized_alpha_names,
+        include_liquidity_context_features=include_liquidity_context_features,
         winsor_lower=winsor_lower,
         winsor_upper=winsor_upper,
         z_clip=z_clip,
     )
+    _merge_signal_neutralization_diagnostics(
+        signal_diagnostics,
+        alpha_neutralization["summary_by_signal"],
+    )
 
-    signal_feature_columns = _signal_feature_columns(specs)
-    context_feature_columns = _context_feature_columns()
+    signal_feature_columns = _signal_feature_columns(
+        specs,
+        neutralized_alpha_signal_names=neutralized_alpha_names,
+    )
+    context_feature_columns = _context_feature_columns(
+        include_liquidity_context_features=include_liquidity_context_features,
+    )
     feature_eligible_frame = _filter_required_feature_rows(
         feature_frame,
         signal_feature_columns=signal_feature_columns,
@@ -208,10 +309,21 @@ def build_alpha_feature_training_panel(
             "feature_transform_universe": "same_date_context_and_signal_rows_before_label_join",
             "sample_weight_universe": "same_date_feature_eligible_rows_before_label_join",
             "signal_sources": [spec.name for spec in specs],
+            "liquidity_signal_sources": list(DEFAULT_LIQUIDITY_SIGNAL_NAMES),
+            "liquidity_signal_features_in_model": any(
+                spec.name in DEFAULT_LIQUIDITY_SIGNAL_NAMES for spec in specs
+            ),
+            "excluded_liquidity_signal_sources": [
+                name
+                for name in DEFAULT_LIQUIDITY_SIGNAL_NAMES
+                if name not in {spec.name for spec in specs}
+            ],
             "liquidity_context_sources": [spec.name for spec in DEFAULT_LIQUIDITY_CONTEXT_SPECS],
+            "liquidity_context_features_in_model": bool(include_liquidity_context_features),
             "liquidity_context_transforms": {
                 spec.name: spec.raw_transform for spec in DEFAULT_LIQUIDITY_CONTEXT_SPECS
             },
+            "alpha_signal_neutralization": alpha_neutralization["summary"],
             "standardization": {
                 "scope": "daily_cross_section",
                 "winsor_lower": float(winsor_lower),
@@ -229,7 +341,12 @@ def build_alpha_feature_training_panel(
         ],
         "feature_standardization": _feature_standardization_diagnostics(feature_eligible_frame),
         "label_distribution": _label_distribution_by_date(panel),
-        "feature_roles": _feature_roles(specs),
+        "alpha_signal_neutralization_diagnostics": alpha_neutralization["diagnostics"],
+        "feature_roles": _feature_roles(
+            specs,
+            neutralized_alpha_signal_names=neutralized_alpha_names,
+            include_liquidity_context_features=include_liquidity_context_features,
+        ),
     }
     return panel, diagnostics
 
@@ -240,12 +357,17 @@ def write_alpha_feature_training_data_artifacts(
     y_resid: pd.DataFrame,
     y_rank_label: pd.DataFrame,
     signal_value_frames: Mapping[str, pd.DataFrame],
+    alpha_rank_frames: Mapping[str, pd.DataFrame] | None = None,
     output_panel: Path,
     output_fold_assignments: Path,
     output_summary: Path,
     diagnostics_dir: Path,
     signal_specs: Sequence[SignalTransformSpec] = DEFAULT_SIGNAL_SPECS,
     folds: Sequence[WalkForwardFold] = DEFAULT_WALK_FORWARD_FOLDS,
+    neutralize_alpha_signal: bool = False,
+    alpha_signal_names: Sequence[str] = DEFAULT_ALPHA_SIGNAL_NAMES,
+    alpha_neutralization_config: BasicNeutralizationConfig | None = None,
+    include_liquidity_context_features: bool = True,
     winsor_lower: float = 0.01,
     winsor_upper: float = 0.99,
     z_clip: float = 5.0,
@@ -256,7 +378,12 @@ def write_alpha_feature_training_data_artifacts(
         y_resid,
         y_rank_label,
         signal_value_frames=signal_value_frames,
+        alpha_rank_frames=alpha_rank_frames,
         signal_specs=signal_specs,
+        neutralize_alpha_signal=neutralize_alpha_signal,
+        alpha_signal_names=alpha_signal_names,
+        alpha_neutralization_config=alpha_neutralization_config,
+        include_liquidity_context_features=include_liquidity_context_features,
         winsor_lower=winsor_lower,
         winsor_upper=winsor_upper,
         z_clip=z_clip,
@@ -289,8 +416,70 @@ def write_alpha_feature_training_data_artifacts(
         diagnostics["label_distribution"],
         diagnostics_dir / "label_distribution_by_date.csv",
     )
+    if not diagnostics["alpha_signal_neutralization_diagnostics"].empty:
+        _write_csv_with_iso_dates(
+            diagnostics["alpha_signal_neutralization_diagnostics"],
+            diagnostics_dir / "alpha_signal_neutralization_diagnostics.csv",
+        )
     _write_csv_with_iso_dates(split_summary, diagnostics_dir / "split_summary.csv")
     _write_csv_with_iso_dates(embargoed_dates, diagnostics_dir / "embargoed_dates.csv")
+
+    signal_spec_names = {spec.name for spec in signal_specs}
+    includes_liquidity_signal_features = any(
+        name in signal_spec_names for name in DEFAULT_LIQUIDITY_SIGNAL_NAMES
+    )
+    model_form = (
+        "p = g(neutralized_alpha_value_rank_and_non_liquidity_signal_rank_z, context_without_liquidity_turnover)"
+        if neutralize_alpha_signal and not include_liquidity_context_features and not includes_liquidity_signal_features
+        else "p = g(neutralized_alpha_value_rank_and_kline_rank_z, context_without_liquidity_turnover)"
+        if neutralize_alpha_signal and not include_liquidity_context_features
+        else "p = g(neutralized_alpha_value_rank_and_kline_rank_z, context_with_liquidity_turnover)"
+        if neutralize_alpha_signal
+        else "p = g(alpha_rank_z_and_kline_rank_z, context_with_liquidity_turnover)"
+    )
+    condition_set = (
+        "industry_board_index_size_no_liquidity_v1"
+        if not include_liquidity_context_features
+        else "industry_board_index_size_liquidity_turnover_v1"
+    )
+    feature_asof = (
+        "same_date_eod_for_close_inputs"
+        if not include_liquidity_context_features and not includes_liquidity_signal_features
+        else "same_date_eod_for_close_amount_volume_inputs"
+        if not include_liquidity_context_features
+        else "same_date_eod_for_close_amount_volume_liquidity_turnover_inputs"
+    )
+    notes = [
+        "Daily rank and robust-z features are computed before joining forward labels.",
+        "The legacy feature role name alpha_placeholder is used for all signal columns so existing context-only training zeroes them together.",
+    ]
+    if includes_liquidity_signal_features and include_liquidity_context_features:
+        notes.append(
+            "Using same-day close/amount/volume/liquidity/turnover assumes an end-of-day signal; do not use this panel for decisions before those fields are observable."
+        )
+    elif includes_liquidity_signal_features:
+        notes.append(
+            "Using same-day close/amount/volume assumes an end-of-day signal; do not use this panel for decisions before those fields are observable."
+        )
+    else:
+        notes.append(
+            "Using same-day close assumes an end-of-day signal; do not use this panel for decisions before close is observable."
+        )
+    if include_liquidity_context_features:
+        notes.append(
+            "Rolling liquidity inputs must be trailing windows ending no later than the signal date; use shifted inputs for pre-open or intraday decisions."
+        )
+    if include_liquidity_context_features:
+        notes.extend(
+            [
+                "Liquidity and turnover rank/z features are context features, so context-only predictions keep them fixed.",
+                "Industry, board, index membership, size, liquidity, and turnover features remain visible to context-only predictions.",
+            ]
+        )
+    else:
+        notes.append(
+            "Only industry, board, index membership, and size features remain visible to context-only predictions."
+        )
 
     summary = {
         "metadata": {
@@ -298,11 +487,21 @@ def write_alpha_feature_training_data_artifacts(
             "alpha_source": "factor_sss_dx_10",
             "alpha_is_real": True,
             "production_eligible": False,
-            "model_form": "p = g(alpha_rank_z_and_kline_rank_z, context_with_liquidity_turnover)",
-            "condition_set": "industry_board_index_size_liquidity_turnover_v1",
-            "feature_asof": "same_date_eod_for_close_amount_volume_liquidity_turnover_inputs",
+            "model_form": model_form,
+            "condition_set": condition_set,
+            "feature_asof": feature_asof,
             "label_contract": "y_resid_fwd and y_rank_label must already be forward-looking labels aligned to signal dates",
-            "liquidity_feature_role": "condition_continuous",
+            "liquidity_feature_role": (
+                "condition_continuous"
+                if include_liquidity_context_features
+                else "removed_from_model_feature_roles"
+            ),
+            "liquidity_signal_feature_role": (
+                "alpha_placeholder"
+                if includes_liquidity_signal_features
+                else "removed_from_model_feature_roles"
+            ),
+            "alpha_signal_neutralization": diagnostics["summary"]["alpha_signal_neutralization"],
         },
         "panel": diagnostics["summary"],
         "signal_inputs": diagnostics["signal_inputs"],
@@ -320,15 +519,23 @@ def write_alpha_feature_training_data_artifacts(
             "diagnostics_dir": _path_for_summary(diagnostics_dir),
             "embargoed_dates": _path_for_summary(diagnostics_dir / "embargoed_dates.csv"),
         },
-        "notes": [
-            "Daily rank and robust-z features are computed before joining forward labels.",
-            "Liquidity and turnover rank/z features are context features, so context-only predictions keep them fixed.",
-            "The legacy feature role name alpha_placeholder is used for all signal columns so existing context-only training zeroes them together.",
-            "Industry, board, index membership, size, liquidity, and turnover features remain visible to context-only predictions.",
-            "Using same-day close/amount/volume/liquidity/turnover assumes an end-of-day signal; do not use this panel for decisions before those fields are observable.",
-            "Rolling liquidity inputs must be trailing windows ending no later than the signal date; use shifted inputs for pre-open or intraday decisions.",
-        ],
+        "notes": notes,
     }
+    if not diagnostics["alpha_signal_neutralization_diagnostics"].empty:
+        summary["outputs"]["alpha_signal_neutralization_diagnostics"] = _path_for_summary(
+            diagnostics_dir / "alpha_signal_neutralization_diagnostics.csv"
+        )
+        summary["notes"].append(
+            "Only alpha signal inputs are neutralized; kline auxiliary signals and context fields are not residualized."
+        )
+    if not include_liquidity_context_features:
+        summary["notes"].append(
+            "Amount, turnover, ADV, logAmount, and turnover20 rank-z features are excluded from model feature_roles."
+        )
+    if not includes_liquidity_signal_features:
+        summary["notes"].append(
+            "Kline amount and volume proxy signals amo/vol are excluded from model feature_roles."
+        )
     output_summary.write_text(
         json.dumps(summary, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
@@ -336,7 +543,11 @@ def write_alpha_feature_training_data_artifacts(
     return summary
 
 
-def _prepare_context_exposures(exposures: pd.DataFrame) -> pd.DataFrame:
+def _prepare_context_exposures(
+    exposures: pd.DataFrame,
+    *,
+    require_liquidity_context: bool = True,
+) -> pd.DataFrame:
     required_columns = {
         "date",
         "stock_code",
@@ -344,8 +555,9 @@ def _prepare_context_exposures(exposures: pd.DataFrame) -> pd.DataFrame:
         "board",
         *DEFAULT_INDEX_COLUMNS,
         "market_cap",
-        *[spec.name for spec in DEFAULT_LIQUIDITY_CONTEXT_SPECS],
     }
+    if require_liquidity_context:
+        required_columns.update(spec.name for spec in DEFAULT_LIQUIDITY_CONTEXT_SPECS)
     missing = sorted(required_columns.difference(exposures.columns))
     if missing:
         raise ValueError(f"Exposures are missing required context columns: {missing}")
@@ -365,7 +577,8 @@ def _prepare_context_exposures(exposures: pd.DataFrame) -> pd.DataFrame:
         frame[column] = pd.to_numeric(frame[column], errors="coerce")
     frame["market_cap"] = pd.to_numeric(frame["market_cap"], errors="coerce")
     for spec in DEFAULT_LIQUIDITY_CONTEXT_SPECS:
-        frame[spec.name] = pd.to_numeric(frame[spec.name], errors="coerce")
+        if spec.name in frame.columns:
+            frame[spec.name] = pd.to_numeric(frame[spec.name], errors="coerce")
     return frame.sort_values(["date", "stock_code"]).reset_index(drop=True)
 
 
@@ -373,10 +586,15 @@ def _add_signal_raw_columns(
     context_frame: pd.DataFrame,
     *,
     signal_value_frames: Mapping[str, pd.DataFrame],
+    alpha_rank_frames: Mapping[str, pd.DataFrame] | None,
+    neutralized_alpha_value_frames: Mapping[str, pd.DataFrame],
+    neutralized_alpha_rank_frames: Mapping[str, pd.DataFrame],
     signal_specs: Sequence[SignalTransformSpec],
+    neutralized_alpha_signal_names: Sequence[str],
 ) -> tuple[pd.DataFrame, dict[str, dict[str, Any]]]:
     frame = context_frame.copy()
     diagnostics: dict[str, dict[str, Any]] = {}
+    neutralized_alpha_name_set = set(neutralized_alpha_signal_names)
     for spec in signal_specs:
         raw_column = _raw_column(spec.name)
         long = _signal_wide_frame_to_long(signal_value_frames[spec.name], spec.name, raw_column)
@@ -397,6 +615,56 @@ def _add_signal_raw_columns(
             "missing_after_context_merge": int(raw_values.isna().sum()),
             "invalid_domain_count": int((context_valid & raw_values.notna() & ~domain_valid).sum()),
         }
+        if spec.name in neutralized_alpha_name_set:
+            if alpha_rank_frames is None:
+                raise ValueError("alpha_rank_frames must be provided when alpha signal neutralization is enabled.")
+            rank_raw_column = _alpha_rank_raw_column(spec.name)
+            rank_long = _signal_wide_frame_to_long(
+                alpha_rank_frames[spec.name],
+                f"{spec.name}_rank",
+                rank_raw_column,
+            )
+            frame = frame.merge(rank_long, on=["date", "stock_code"], how="left", validate="one_to_one")
+
+            value_neutral_column = _alpha_value_neutralized_raw_column(spec.name)
+            value_neutral_long = _signal_wide_frame_to_long(
+                neutralized_alpha_value_frames[spec.name],
+                f"{spec.name}_value_neutralized",
+                value_neutral_column,
+            )
+            frame = frame.merge(
+                value_neutral_long,
+                on=["date", "stock_code"],
+                how="left",
+                validate="one_to_one",
+            )
+
+            rank_neutral_column = _alpha_rank_neutralized_raw_column(spec.name)
+            rank_neutral_long = _signal_wide_frame_to_long(
+                neutralized_alpha_rank_frames[spec.name],
+                f"{spec.name}_rank_neutralized",
+                rank_neutral_column,
+            )
+            frame = frame.merge(
+                rank_neutral_long,
+                on=["date", "stock_code"],
+                how="left",
+                validate="one_to_one",
+            )
+            diagnostics[spec.name].update(
+                {
+                    "rank_raw_column": rank_raw_column,
+                    "rank_input_nonmissing_count": int(rank_long[rank_raw_column].notna().sum()),
+                    "neutralized_value_column": value_neutral_column,
+                    "neutralized_value_nonmissing_count": int(
+                        value_neutral_long[value_neutral_column].notna().sum()
+                    ),
+                    "neutralized_rank_column": rank_neutral_column,
+                    "neutralized_rank_nonmissing_count": int(
+                        rank_neutral_long[rank_neutral_column].notna().sum()
+                    ),
+                }
+            )
     return frame, diagnostics
 
 
@@ -404,12 +672,15 @@ def _add_alpha_feature_columns(
     feature_frame: pd.DataFrame,
     *,
     signal_specs: Sequence[SignalTransformSpec],
+    neutralized_alpha_signal_names: Sequence[str],
+    include_liquidity_context_features: bool,
     winsor_lower: float,
     winsor_upper: float,
     z_clip: float,
 ) -> pd.DataFrame:
     frame = feature_frame.copy()
     frame["alpha_source"] = "factor_sss_dx_10"
+    neutralized_alpha_name_set = set(neutralized_alpha_signal_names)
 
     context_valid = _context_valid_mask(frame)
     market_cap = frame["market_cap"].where(context_valid)
@@ -439,30 +710,53 @@ def _add_alpha_feature_columns(
         )
     ]
 
-    for spec in DEFAULT_LIQUIDITY_CONTEXT_SPECS:
-        _add_rank_z_columns(
-            frame,
-            source_column=spec.name,
-            output_name=spec.name,
-            context_valid=context_valid,
-            raw_transform=spec.raw_transform,
-            winsor_lower=winsor_lower,
-            winsor_upper=winsor_upper,
-            z_clip=z_clip,
-        )
+    if include_liquidity_context_features:
+        for spec in DEFAULT_LIQUIDITY_CONTEXT_SPECS:
+            _add_rank_z_columns(
+                frame,
+                source_column=spec.name,
+                output_name=spec.name,
+                context_valid=context_valid,
+                raw_transform=spec.raw_transform,
+                winsor_lower=winsor_lower,
+                winsor_upper=winsor_upper,
+                z_clip=z_clip,
+            )
 
     for spec in signal_specs:
-        raw_column = _raw_column(spec.name)
-        _add_rank_z_columns(
-            frame,
-            source_column=raw_column,
-            output_name=spec.name,
-            context_valid=context_valid,
-            raw_transform=spec.raw_transform,
-            winsor_lower=winsor_lower,
-            winsor_upper=winsor_upper,
-            z_clip=z_clip,
-        )
+        if spec.name in neutralized_alpha_name_set:
+            _add_rank_z_columns(
+                frame,
+                source_column=_alpha_value_neutralized_raw_column(spec.name),
+                output_name=_alpha_value_neutralized_feature_name(spec.name),
+                context_valid=context_valid,
+                raw_transform="identity",
+                winsor_lower=winsor_lower,
+                winsor_upper=winsor_upper,
+                z_clip=z_clip,
+            )
+            _add_rank_z_columns(
+                frame,
+                source_column=_alpha_rank_neutralized_raw_column(spec.name),
+                output_name=_alpha_rank_neutralized_feature_name(spec.name),
+                context_valid=context_valid,
+                raw_transform="identity",
+                winsor_lower=winsor_lower,
+                winsor_upper=winsor_upper,
+                z_clip=z_clip,
+            )
+        else:
+            raw_column = _raw_column(spec.name)
+            _add_rank_z_columns(
+                frame,
+                source_column=raw_column,
+                output_name=spec.name,
+                context_valid=context_valid,
+                raw_transform=spec.raw_transform,
+                winsor_lower=winsor_lower,
+                winsor_upper=winsor_upper,
+                z_clip=z_clip,
+            )
     return frame
 
 
@@ -653,11 +947,51 @@ def _daily_transform(frame: pd.DataFrame, column: str, function: Callable[[pd.Se
     return frame.groupby("date", group_keys=False)[column].transform(function)
 
 
-def _feature_roles(signal_specs: Sequence[SignalTransformSpec]) -> dict[str, list[str]]:
+def _feature_roles(
+    signal_specs: Sequence[SignalTransformSpec],
+    *,
+    neutralized_alpha_signal_names: Sequence[str] = (),
+    include_liquidity_context_features: bool = True,
+) -> dict[str, list[str]]:
     raw_columns = [_raw_column(spec.name) for spec in signal_specs]
-    liquidity_columns = [spec.name for spec in DEFAULT_LIQUIDITY_CONTEXT_SPECS]
-    input_columns = [*raw_columns, *liquidity_columns]
-    signal_feature_columns = _signal_feature_columns(signal_specs)
+    signal_names = {spec.name for spec in signal_specs}
+    liquidity_columns = (
+        [spec.name for spec in DEFAULT_LIQUIDITY_CONTEXT_SPECS]
+        if include_liquidity_context_features
+        else []
+    )
+    neutralized_alpha_name_set = set(neutralized_alpha_signal_names)
+    alpha_rank_raw_columns = [
+        _alpha_rank_raw_column(spec.name)
+        for spec in signal_specs
+        if spec.name in neutralized_alpha_name_set
+    ]
+    alpha_neutralized_raw_columns = [
+        column
+        for spec in signal_specs
+        if spec.name in neutralized_alpha_name_set
+        for column in (
+            _alpha_value_neutralized_raw_column(spec.name),
+            _alpha_rank_neutralized_raw_column(spec.name),
+        )
+    ]
+    input_columns = [
+        *raw_columns,
+        *alpha_rank_raw_columns,
+        *alpha_neutralized_raw_columns,
+        *liquidity_columns,
+    ]
+    signal_feature_columns = _signal_feature_columns(
+        signal_specs,
+        neutralized_alpha_signal_names=neutralized_alpha_signal_names,
+    )
+    liquidity_feature_columns = _liquidity_context_feature_columns()
+    excluded_liquidity_signal_feature_columns = [
+        column
+        for name in DEFAULT_LIQUIDITY_SIGNAL_NAMES
+        if name not in signal_names
+        for column in (_rank_column(name), _z_column(name))
+    ]
     return {
         "alpha_placeholder": signal_feature_columns,
         "condition_categorical": ["industry", "board", "index_bucket", "size_decile"],
@@ -668,7 +1002,7 @@ def _feature_roles(signal_specs: Sequence[SignalTransformSpec]) -> dict[str, lis
             "is_csi2000",
             "log_mcap_z",
             "mcap_rank",
-            *_liquidity_context_feature_columns(),
+            *(liquidity_feature_columns if include_liquidity_context_features else []),
         ],
         "traceability": [
             "date",
@@ -678,6 +1012,8 @@ def _feature_roles(signal_specs: Sequence[SignalTransformSpec]) -> dict[str, lis
             "log_mcap",
             *liquidity_columns,
             *raw_columns,
+            *alpha_rank_raw_columns,
+            *alpha_neutralized_raw_columns,
         ],
         "excluded_from_model": [
             "date",
@@ -690,21 +1026,40 @@ def _feature_roles(signal_specs: Sequence[SignalTransformSpec]) -> dict[str, lis
             "log_mcap",
             *liquidity_columns,
             *raw_columns,
+            *alpha_rank_raw_columns,
+            *alpha_neutralized_raw_columns,
             *[_rank_input_column(column) for column in input_columns],
             *[_z_input_column(column) for column in input_columns],
+            *(liquidity_feature_columns if not include_liquidity_context_features else []),
+            *excluded_liquidity_signal_feature_columns,
         ],
         "targets": ["y_resid_fwd", "y_rank_label"],
     }
 
 
-def _signal_feature_columns(signal_specs: Sequence[SignalTransformSpec]) -> list[str]:
+def _signal_feature_columns(
+    signal_specs: Sequence[SignalTransformSpec],
+    *,
+    neutralized_alpha_signal_names: Sequence[str] = (),
+) -> list[str]:
     columns: list[str] = []
+    neutralized_alpha_name_set = set(neutralized_alpha_signal_names)
     for spec in signal_specs:
-        columns.extend([_rank_column(spec.name), _z_column(spec.name)])
+        if spec.name in neutralized_alpha_name_set:
+            columns.extend(
+                [
+                    _rank_column(_alpha_value_neutralized_feature_name(spec.name)),
+                    _z_column(_alpha_value_neutralized_feature_name(spec.name)),
+                    _rank_column(_alpha_rank_neutralized_feature_name(spec.name)),
+                    _z_column(_alpha_rank_neutralized_feature_name(spec.name)),
+                ]
+            )
+        else:
+            columns.extend([_rank_column(spec.name), _z_column(spec.name)])
     return columns
 
 
-def _context_feature_columns() -> list[str]:
+def _context_feature_columns(*, include_liquidity_context_features: bool = True) -> list[str]:
     return [
         "industry",
         "board",
@@ -716,7 +1071,7 @@ def _context_feature_columns() -> list[str]:
         "is_csi2000",
         "log_mcap_z",
         "mcap_rank",
-        *_liquidity_context_feature_columns(),
+        *(_liquidity_context_feature_columns() if include_liquidity_context_features else []),
     ]
 
 
@@ -747,6 +1102,190 @@ def _z_input_column(raw_column: str) -> str:
     return f"{raw_column}__z_input"
 
 
+def _alpha_rank_raw_column(signal_name: str) -> str:
+    return f"{signal_name}_rank_raw"
+
+
+def _alpha_value_neutralized_raw_column(signal_name: str) -> str:
+    return f"{signal_name}_value_neutralized_raw"
+
+
+def _alpha_rank_neutralized_raw_column(signal_name: str) -> str:
+    return f"{signal_name}_rank_neutralized_raw"
+
+
+def _alpha_value_neutralized_feature_name(signal_name: str) -> str:
+    return f"{signal_name}_value_neutralized"
+
+
+def _alpha_rank_neutralized_feature_name(signal_name: str) -> str:
+    return f"{signal_name}_rank_neutralized"
+
+
+def _neutralize_alpha_signal_inputs(
+    context_frame: pd.DataFrame,
+    *,
+    signal_value_frames: Mapping[str, pd.DataFrame],
+    alpha_rank_frames: Mapping[str, pd.DataFrame] | None,
+    alpha_signal_names: Sequence[str],
+    config: BasicNeutralizationConfig | None,
+) -> dict[str, Any]:
+    signal_names = tuple(alpha_signal_names)
+    if not signal_names:
+        return {
+            "value_frames": {},
+            "rank_frames": {},
+            "summary": {
+                "enabled": False,
+                "signal_names": [],
+                "neutralized_input_kinds": [],
+            },
+            "summary_by_signal": {},
+            "diagnostics": pd.DataFrame(),
+        }
+    if alpha_rank_frames is None:
+        raise ValueError("alpha_rank_frames must be provided when alpha signal neutralization is enabled.")
+
+    cfg = config or BasicNeutralizationConfig(winsor_lower=None, winsor_upper=None)
+    context_dates = pd.DatetimeIndex(
+        pd.to_datetime(sorted(context_frame["date"].dropna().unique()), errors="coerce")
+    ).normalize()
+    value_frames: dict[str, pd.DataFrame] = {}
+    rank_frames: dict[str, pd.DataFrame] = {}
+    summary_by_signal: dict[str, Any] = {}
+    diagnostic_frames: list[pd.DataFrame] = []
+
+    for signal_name in signal_names:
+        value_matrix = _matrix_on_context_dates(
+            _normalize_signal_matrix(signal_value_frames[signal_name], signal_name),
+            context_dates,
+        )
+        rank_matrix = _matrix_on_context_dates(
+            _normalize_signal_matrix(alpha_rank_frames[signal_name], f"{signal_name}_rank"),
+            context_dates,
+        )
+        value_residual, _, value_diagnostics, value_summary = neutralize_return_y_matrix(
+            value_matrix,
+            context_frame,
+            config=cfg,
+        )
+        rank_residual, _, rank_diagnostics, rank_summary = neutralize_return_y_matrix(
+            rank_matrix,
+            context_frame,
+            config=cfg,
+        )
+        value_frames[signal_name] = value_residual
+        rank_frames[signal_name] = rank_residual
+        summary_by_signal[signal_name] = {
+            "value": _alpha_neutralization_kind_summary(value_summary, value_diagnostics),
+            "rank": _alpha_neutralization_kind_summary(rank_summary, rank_diagnostics),
+        }
+        diagnostic_frames.append(
+            _tag_alpha_neutralization_diagnostics(
+                value_diagnostics,
+                signal_name=signal_name,
+                input_kind="value",
+            )
+        )
+        diagnostic_frames.append(
+            _tag_alpha_neutralization_diagnostics(
+                rank_diagnostics,
+                signal_name=signal_name,
+                input_kind="rank",
+            )
+        )
+
+    diagnostics = (
+        pd.concat(diagnostic_frames, ignore_index=True)
+        if diagnostic_frames
+        else pd.DataFrame()
+    )
+    return {
+        "value_frames": value_frames,
+        "rank_frames": rank_frames,
+        "summary": {
+            "enabled": True,
+            "signal_names": list(signal_names),
+            "neutralized_input_kinds": ["value", "rank"],
+            "neutralization_scope": "daily_cross_section",
+            "exposure_set": [
+                "industry",
+                "board",
+                *DEFAULT_INDEX_COLUMNS,
+                "market_cap_centered_rank",
+            ],
+            "input_transform": "raw_alpha_inputs_no_winsorization"
+            if cfg.winsor_lower is None and cfg.winsor_upper is None
+            else "winsorized_alpha_inputs",
+            "config": _json_safe_config(cfg),
+            "by_signal": summary_by_signal,
+        },
+        "summary_by_signal": summary_by_signal,
+        "diagnostics": diagnostics,
+    }
+
+
+def _matrix_on_context_dates(matrix: pd.DataFrame, context_dates: pd.DatetimeIndex) -> pd.DataFrame:
+    dates = matrix.index.intersection(context_dates)
+    return matrix.loc[dates].copy()
+
+
+def _alpha_neutralization_kind_summary(
+    summary: dict[str, Any],
+    diagnostics: pd.DataFrame,
+) -> dict[str, Any]:
+    processed = diagnostics[~diagnostics["skipped"].astype(bool)] if not diagnostics.empty else diagnostics
+    return {
+        "date_count": int(summary["date_count"]),
+        "processed_date_count": int(summary["processed_date_count"]),
+        "skipped_date_count": int(summary["skipped_date_count"]),
+        "neutralization_type": summary["neutralization_type"],
+        "input_transform": summary["input_return_transform"],
+        "max_abs_industry_mean_after": _diagnostic_abs_max(processed, "max_abs_industry_mean_after"),
+        "max_abs_board_mean_after": _diagnostic_abs_max(processed, "max_abs_board_mean_after"),
+        "max_abs_continuous_exposure_after": _diagnostic_abs_max(
+            processed,
+            "max_abs_continuous_exposure_after",
+        ),
+    }
+
+
+def _tag_alpha_neutralization_diagnostics(
+    diagnostics: pd.DataFrame,
+    *,
+    signal_name: str,
+    input_kind: str,
+) -> pd.DataFrame:
+    tagged = diagnostics.copy()
+    tagged.insert(0, "input_kind", input_kind)
+    tagged.insert(0, "signal_name", signal_name)
+    return tagged
+
+
+def _diagnostic_abs_max(frame: pd.DataFrame, column: str) -> float:
+    if frame.empty or column not in frame.columns:
+        return np.nan
+    values = pd.to_numeric(frame[column], errors="coerce").abs()
+    finite = values[np.isfinite(values.to_numpy(dtype=float, copy=False))]
+    return float(finite.max()) if len(finite) else np.nan
+
+
+def _merge_signal_neutralization_diagnostics(
+    signal_diagnostics: dict[str, dict[str, Any]],
+    neutralization_by_signal: Mapping[str, Any],
+) -> None:
+    for signal_name, neutralization_summary in neutralization_by_signal.items():
+        signal_diagnostics.setdefault(signal_name, {})
+        signal_diagnostics[signal_name]["alpha_signal_neutralization"] = neutralization_summary
+
+
+def _json_safe_config(config: BasicNeutralizationConfig) -> dict[str, Any]:
+    return {
+        key: list(value) if isinstance(value, tuple) else value
+        for key, value in asdict(config).items()
+    }
+
+
 def _validate_signal_inputs(
     signal_value_frames: Mapping[str, pd.DataFrame],
     signal_specs: Sequence[SignalTransformSpec],
@@ -755,6 +1294,24 @@ def _validate_signal_inputs(
     missing = sorted(required.difference(signal_value_frames.keys()))
     if missing:
         raise ValueError(f"Missing required signal value frames: {missing}")
+
+
+def _validate_alpha_neutralization_inputs(
+    signal_specs: Sequence[SignalTransformSpec],
+    alpha_rank_frames: Mapping[str, pd.DataFrame] | None,
+    alpha_signal_names: Sequence[str],
+) -> None:
+    if not alpha_signal_names:
+        return
+    available = {spec.name for spec in signal_specs}
+    unknown = sorted(set(alpha_signal_names).difference(available))
+    if unknown:
+        raise ValueError(f"Alpha signal neutralization requested unknown signal specs: {unknown}")
+    if alpha_rank_frames is None:
+        raise ValueError("alpha_rank_frames must be provided when alpha signal neutralization is enabled.")
+    missing = sorted(set(alpha_signal_names).difference(alpha_rank_frames.keys()))
+    if missing:
+        raise ValueError(f"Missing required alpha rank frames for neutralization: {missing}")
 
 
 def _validate_winsor_config(winsor_lower: float, winsor_upper: float, z_clip: float) -> None:
