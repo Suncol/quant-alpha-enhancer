@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import argparse
 import hashlib
@@ -30,10 +30,18 @@ except ModuleNotFoundError:  # Allows direct execution via python analysis/scrip
 
 
 RAW_LIQUIDITY_COLUMNS = ("amount_k", "turnover", "logADV20", "logAmount20", "turnover20")
+INDEX_UNKNOWN_COLUMNS = tuple(f"{column}_unknown" for column in DEFAULT_INDEX_COLUMNS)
+INDEX_STATUS_COLUMNS = (
+    "index_membership_any_unknown",
+    "index_membership_all_known",
+    "historical_pit_index_membership",
+)
 RAW_CONTEXT_COLUMNS = (
     "industry",
     "board",
     *DEFAULT_INDEX_COLUMNS,
+    *INDEX_UNKNOWN_COLUMNS,
+    *INDEX_STATUS_COLUMNS,
     "market_cap",
     *RAW_LIQUIDITY_COLUMNS,
 )
@@ -221,7 +229,35 @@ def _prepare_raw_context_exposures(exposures: pd.DataFrame) -> pd.DataFrame:
         sample = _records_with_dates(duplicates.head(5))
         raise ValueError(f"Exposures contain duplicate date, stock_code keys: {sample}")
 
-    for column in (*DEFAULT_INDEX_COLUMNS, "market_cap", *RAW_LIQUIDITY_COLUMNS):
+    for column in (*DEFAULT_INDEX_COLUMNS, *INDEX_UNKNOWN_COLUMNS, *INDEX_STATUS_COLUMNS):
+        numeric = pd.to_numeric(frame[column], errors="coerce")
+        invalid = numeric.isna() | ~numeric.isin([0, 1])
+        if invalid.any():
+            sample = _records_with_dates(frame.loc[invalid, list(DATE_STOCK_COLUMNS) + [column]].head(5))
+            raise ValueError(f"Index membership column {column!r} must contain finite 0/1 values: {sample}")
+        frame[column] = numeric.astype("int8")
+
+    for flag_column, unknown_column in zip(DEFAULT_INDEX_COLUMNS, INDEX_UNKNOWN_COLUMNS, strict=True):
+        conflict = frame[flag_column].eq(1) & frame[unknown_column].eq(1)
+        if conflict.any():
+            sample = _records_with_dates(frame.loc[conflict, list(DATE_STOCK_COLUMNS) + [flag_column, unknown_column]].head(5))
+            raise ValueError(f"Index membership column {flag_column!r} cannot be true when {unknown_column!r} is true: {sample}")
+
+    expected_any_unknown = frame[list(INDEX_UNKNOWN_COLUMNS)].eq(1).any(axis=1)
+    any_unknown_mismatch = frame["index_membership_any_unknown"].astype(bool).ne(expected_any_unknown)
+    if any_unknown_mismatch.any():
+        sample = _records_with_dates(frame.loc[any_unknown_mismatch, list(DATE_STOCK_COLUMNS)].head(5))
+        raise ValueError(f"index_membership_any_unknown is inconsistent with per-index unknown flags: {sample}")
+    all_known_mismatch = frame["index_membership_all_known"].astype(bool).ne(~expected_any_unknown)
+    if all_known_mismatch.any():
+        sample = _records_with_dates(frame.loc[all_known_mismatch, list(DATE_STOCK_COLUMNS)].head(5))
+        raise ValueError(f"index_membership_all_known is inconsistent with per-index unknown flags: {sample}")
+    historical_invalid = frame["historical_pit_index_membership"].ne(1)
+    if historical_invalid.any():
+        sample = _records_with_dates(frame.loc[historical_invalid, list(DATE_STOCK_COLUMNS)].head(5))
+        raise ValueError(f"historical_pit_index_membership must be 1 for PIT index exposure rows: {sample}")
+
+    for column in ("market_cap", *RAW_LIQUIDITY_COLUMNS):
         frame[column] = pd.to_numeric(frame[column], errors="coerce")
     return frame.sort_values(list(DATE_STOCK_COLUMNS)).reset_index(drop=True)
 
@@ -364,12 +400,20 @@ def _categorical_dummy_matrix(
 def _index_dummy_matrix(raw_features: pd.DataFrame) -> pd.DataFrame:
     keys = raw_features.loc[:, list(DATE_STOCK_COLUMNS)].copy()
     flags = raw_features.loc[:, list(DEFAULT_INDEX_COLUMNS)].apply(pd.to_numeric, errors="coerce")
-    finite = np.isfinite(flags.to_numpy(dtype=float, copy=False))
-    zero_or_one = np.isin(flags.to_numpy(dtype=float, copy=False), [0.0, 1.0])
+    unknown = raw_features.loc[:, list(INDEX_UNKNOWN_COLUMNS)].apply(pd.to_numeric, errors="coerce")
+    combined = pd.concat([flags, unknown], axis=1)
+    finite = np.isfinite(combined.to_numpy(dtype=float, copy=False))
+    zero_or_one = np.isin(combined.to_numpy(dtype=float, copy=False), [0.0, 1.0])
     if not (finite & zero_or_one).all():
         invalid_mask = pd.Series(~(finite & zero_or_one).all(axis=1), index=raw_features.index)
         sample = _records_with_dates(raw_features.loc[invalid_mask, list(DATE_STOCK_COLUMNS)].head(5))
-        raise ValueError(f"Index membership flags must be finite 0/1 values. Invalid rows: {sample}")
+        raise ValueError(f"Index membership and unknown flags must be finite 0/1 values. Invalid rows: {sample}")
+
+    for flag_column, unknown_column in zip(DEFAULT_INDEX_COLUMNS, INDEX_UNKNOWN_COLUMNS, strict=True):
+        conflict = flags[flag_column].eq(1.0) & unknown[unknown_column].eq(1.0)
+        if conflict.any():
+            sample = _records_with_dates(raw_features.loc[conflict, list(DATE_STOCK_COLUMNS)].head(5))
+            raise ValueError(f"Rows contain conflicting index membership and unknown flags: {sample}")
 
     row_sums = flags.sum(axis=1)
     overlapping = row_sums.gt(1.0)
@@ -377,13 +421,14 @@ def _index_dummy_matrix(raw_features: pd.DataFrame) -> pd.DataFrame:
         sample = _records_with_dates(raw_features.loc[overlapping, list(DATE_STOCK_COLUMNS)].head(5))
         raise ValueError(f"Rows contain multiple index membership flags and cannot be one-hot encoded: {sample}")
 
+    any_unknown = unknown.sum(axis=1).gt(0.0)
     matrix = keys.copy()
     for column in DEFAULT_INDEX_COLUMNS:
         matrix[f"index__{INDEX_FLAG_TO_NAME[column]}"] = flags[column].astype("int8")
-    matrix["index__NON_INDEX"] = row_sums.eq(0.0).astype("int8")
+    matrix["index__UNKNOWN_INDEX"] = (row_sums.eq(0.0) & any_unknown).astype("int8")
+    matrix["index__NON_INDEX"] = (row_sums.eq(0.0) & ~any_unknown).astype("int8")
     _validate_one_hot_matrix(matrix, matrix_name="index_dummy_matrix")
     return matrix
-
 
 def _validate_one_hot_matrix(matrix: pd.DataFrame, *, matrix_name: str) -> None:
     values = matrix.drop(columns=list(DATE_STOCK_COLUMNS))
@@ -453,6 +498,8 @@ def _build_manifest(
         "raw_context_columns": list(RAW_CONTEXT_COLUMNS),
         "raw_liquidity_columns": list(RAW_LIQUIDITY_COLUMNS),
         "index_membership_flag_columns": list(DEFAULT_INDEX_COLUMNS),
+        "index_membership_unknown_columns": list(INDEX_UNKNOWN_COLUMNS),
+        "index_membership_status_columns": list(INDEX_STATUS_COLUMNS),
         "index_constituent_row_count": int(len(constituents)),
         "dummy_matrices": _json_safe(dummy_matrix_summary),
         "signal_inputs": _json_safe(signal_diagnostics),
@@ -469,6 +516,7 @@ def _build_manifest(
         "notes": [
             "No cross-sectional z-score, rank feature, winsorization, neutralization, label, or sample_weight column is exported.",
             "Index constituents are derived directly from raw index membership flag columns.",
+            "Index dummy matrices include UNKNOWN_INDEX for rows with no confirmed CSI membership and at least one unknown index-date source.",
             "Industry, board, and index dummy matrices are one-hot: every exported date-stock row has exactly one active category per matrix.",
             "The package stores CSV for portability and pickle for dtype-preserving Python reloads.",
         ],
@@ -665,3 +713,7 @@ def _json_safe(value: Any) -> Any:
 
 if __name__ == "__main__":
     main()
+
+
+
+

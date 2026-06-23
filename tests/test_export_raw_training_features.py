@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import zipfile
@@ -13,7 +13,7 @@ from analysis.export_raw_training_features import (
 
 
 def _make_exposures() -> pd.DataFrame:
-    return pd.DataFrame(
+    frame = pd.DataFrame(
         [
             {
                 "date": "2024-01-02 15:00:00",
@@ -65,6 +65,12 @@ def _make_exposures() -> pd.DataFrame:
             },
         ]
     )
+    for column in ("is_csi300_unknown", "is_csi500_unknown", "is_csi1000_unknown", "is_csi2000_unknown"):
+        frame[column] = False
+    frame["index_membership_any_unknown"] = False
+    frame["index_membership_all_known"] = True
+    frame["historical_pit_index_membership"] = True
+    return frame
 
 
 def _stock_by_date(values: list[list[float]]) -> pd.DataFrame:
@@ -133,10 +139,10 @@ def test_export_raw_training_feature_package_writes_raw_features_and_archive(tmp
         [1, 0],
         [0, 1],
     ]
-    assert index_dummy[["index__CSI300", "index__CSI500", "index__CSI1000", "index__CSI2000", "index__NON_INDEX"]].to_numpy().tolist() == [
-        [1, 0, 0, 0, 0],
-        [0, 1, 0, 0, 0],
-        [1, 0, 0, 0, 0],
+    assert index_dummy[["index__CSI300", "index__CSI500", "index__CSI1000", "index__CSI2000", "index__UNKNOWN_INDEX", "index__NON_INDEX"]].to_numpy().tolist() == [
+        [1, 0, 0, 0, 0, 0],
+        [0, 1, 0, 0, 0, 0],
+        [1, 0, 0, 0, 0, 0],
     ]
     for dummy in [industry_dummy, board_dummy, index_dummy]:
         dummy_values = dummy.drop(columns=["date", "stock_code"])
@@ -234,6 +240,30 @@ def test_export_raw_training_feature_package_can_use_training_universe(tmp_path:
     assert summary["universe"]["dropped_exposure_rows_not_in_universe"] == 1
 
 
+def test_export_raw_training_feature_package_marks_unknown_index_separately_from_non_index(tmp_path: Path) -> None:
+    exposures = _make_exposures()
+    unknown = exposures.iloc[[0]].copy()
+    unknown["date"] = "2024-01-04"
+    unknown["stock_code"] = "000003"
+    for column in ["is_csi300", "is_csi500", "is_csi1000", "is_csi2000"]:
+        unknown[column] = 0
+    unknown["is_csi2000_unknown"] = True
+    unknown["index_membership_any_unknown"] = True
+    unknown["index_membership_all_known"] = False
+    exposures = pd.concat([exposures, unknown], ignore_index=True)
+
+    export_raw_training_feature_package(
+        exposures=exposures,
+        output_dir=tmp_path / "out",
+        archive_path=tmp_path / "out.zip",
+    )
+
+    index_dummy = pd.read_csv(tmp_path / "out" / "index_dummy_matrix.csv", dtype={"stock_code": "string"})
+    row = index_dummy[index_dummy["stock_code"].eq("000003")].iloc[0]
+    assert int(row["index__UNKNOWN_INDEX"]) == 1
+    assert int(row["index__NON_INDEX"]) == 0
+
+
 def test_export_raw_training_feature_package_rejects_non_one_hot_index_flags(tmp_path: Path) -> None:
     exposures = _make_exposures()
     exposures.loc[0, "is_csi500"] = 1
@@ -248,3 +278,4 @@ def test_export_raw_training_feature_package_rejects_non_one_hot_index_flags(tmp
         assert "multiple index membership flags" in str(exc)
     else:
         raise AssertionError("Expected overlapping index membership flags to fail loudly.")
+
